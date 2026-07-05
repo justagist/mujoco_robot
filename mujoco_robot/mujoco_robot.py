@@ -12,7 +12,7 @@ radians. A compiled ``MjModel`` always stores angles in radians regardless of th
 conversion is needed or performed.
 """
 
-from typing import Dict, List, Mapping, Optional, TypeAlias
+from typing import Dict, List, Mapping, Optional, Tuple, TypeAlias
 from dataclasses import dataclass
 import atexit
 import threading
@@ -129,6 +129,27 @@ class MujocoJointInfo:
     """dof damping (nan for multi-dof joints)."""
     actuator_id: Optional[int]
     """Id of the JOINT-transmission actuator driving this joint, or None."""
+
+
+@dataclass
+class MujocoRobotState:
+    """A snapshot of common robot state (world frame; quaternions are [x,y,z,w]).
+
+    Returned by :meth:`MujocoRobot.get_robot_states`.
+    """
+
+    base_position: Vector3D
+    base_com_position: Vector3D
+    base_quaternion: QuatType
+    base_velocity_linear: Vector3D
+    base_velocity_angular: Vector3D
+    actuated_joint_positions: np.ndarray
+    actuated_joint_velocities: np.ndarray
+    actuated_joint_torques: np.ndarray
+    joint_order: List[str]
+    """Actuated-joint names, in the order the joint arrays are given."""
+    ee_order: List[str]
+    """End-effector names reported."""
 
 
 class MujocoObject:
@@ -596,6 +617,216 @@ class MujocoRobot(MujocoObject):
                 break
             pos[2] += move_resolution
         self.default_start_pose[0] = pos
+
+    def _get_scratch_data(self) -> mujoco.MjData:
+        """A reusable ``MjData`` for queries that must not disturb the live state."""
+        if getattr(self, "_scratch_data", None) is None:
+            self._scratch_data = mujoco.MjData(self.model)
+        return self._scratch_data
+
+    # --- joint state --------------------------------------------------------
+
+    def get_joint_states(
+        self, joint_ids: List[int] = None
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Get (positions, velocities, applied efforts) for the given joints.
+
+        Continuous-joint positions are wrapped to [-pi, pi]. Effort is the applied actuation
+        generalised force on the joint (``qfrc_actuator`` + ``qfrc_applied``).
+
+        Args:
+            joint_ids (List[int], optional): Joints to read. Defaults to all actuated joints.
+
+        Returns:
+            Tuple[np.ndarray, np.ndarray, np.ndarray]: positions, velocities, efforts.
+        """
+        if joint_ids is None:
+            joint_ids = self.actuated_joint_ids
+        n = len(joint_ids)
+        q, v, tau = np.zeros(n), np.zeros(n), np.zeros(n)
+        with self._lock:
+            for i, jid in enumerate(joint_ids):
+                info = self.joint_name_to_info[self.joint_id_to_name[jid]]
+                pos = self.data.qpos[info.qpos_adr]
+                q[i] = wrap_angle(pos) if jid in self.continuous_joint_ids else pos
+                v[i] = self.data.qvel[info.dof_adr]
+                tau[i] = (
+                    self.data.qfrc_actuator[info.dof_adr]
+                    + self.data.qfrc_applied[info.dof_adr]
+                )
+        return q, v, tau
+
+    def get_actuated_joint_positions(self, actuated_joint_names: List[str] = None) -> np.ndarray:
+        """Get current positions of the actuated joints (defaults to all, in default order)."""
+        if actuated_joint_names is None:
+            actuated_joint_names = self.actuated_joint_names
+        return self.get_joint_states(self.get_joint_ids(actuated_joint_names))[0]
+
+    def get_actuated_joint_velocities(self, actuated_joint_names: List[str] = None) -> np.ndarray:
+        """Get current velocities of the actuated joints (defaults to all, in default order)."""
+        if actuated_joint_names is None:
+            actuated_joint_names = self.actuated_joint_names
+        return self.get_joint_states(self.get_joint_ids(actuated_joint_names))[1]
+
+    def get_actuated_joint_torques(self, actuated_joint_names: List[str] = None) -> np.ndarray:
+        """Get current efforts of the actuated joints (defaults to all, in default order)."""
+        if actuated_joint_names is None:
+            actuated_joint_names = self.actuated_joint_names
+        return self.get_joint_states(self.get_joint_ids(actuated_joint_names))[2]
+
+    # --- base state ---------------------------------------------------------
+
+    def _object_velocity(self, body_id: int) -> Tuple[Vector3D, Vector3D]:
+        """World-frame spatial velocity of a body as (linear, angular)."""
+        res = np.zeros(6)
+        with self._lock:
+            mujoco.mj_objectVelocity(
+                self.model, self.data, mujoco.mjtObj.mjOBJ_BODY, int(body_id), res, 0
+            )
+        # mj_objectVelocity returns [angular (3), linear (3)].
+        return np.array(res[3:]), np.array(res[:3])
+
+    def get_base_pose(self) -> Tuple[Vector3D, QuatType]:
+        """Get the world-frame base pose as (position, orientation quaternion [x,y,z,w])."""
+        with self._lock:
+            pos = np.array(self.data.xpos[self.base_id])
+            quat = wxyz_to_xyzw(self.data.xquat[self.base_id])
+        return pos, quat
+
+    def get_base_velocity(self) -> Tuple[Vector3D, Vector3D]:
+        """Get the world-frame base velocity as (linear velocity, angular velocity)."""
+        return self._object_velocity(self.base_id)
+
+    def get_base_com_position(self) -> Vector3D:
+        """Get the world-frame position of the base link's centre of mass."""
+        with self._lock:
+            return np.array(self.data.xipos[self.base_id])
+
+    # --- link / site state --------------------------------------------------
+
+    def get_link_pose(self, link_id: int) -> Tuple[Vector3D, QuatType]:
+        """Get the world-frame link (body) pose as (position, orientation quaternion [x,y,z,w])."""
+        with self._lock:
+            return np.array(self.data.xpos[link_id]), wxyz_to_xyzw(self.data.xquat[link_id])
+
+    def get_link_velocity(self, link_id: int) -> Tuple[Vector3D, Vector3D]:
+        """Get the world-frame link velocity as (linear velocity, angular velocity)."""
+        return self._object_velocity(link_id)
+
+    def get_link_com_pose(self, link_id: int) -> Tuple[Vector3D, QuatType]:
+        """Get the world-frame pose of the link's centre of mass as (position, orientation)."""
+        quat = np.zeros(4)
+        with self._lock:
+            pos = np.array(self.data.xipos[link_id])
+            mujoco.mju_mat2Quat(quat, self.data.ximat[link_id])
+        return pos, wxyz_to_xyzw(quat)
+
+    def get_site_pose(self, site_id: int) -> Tuple[Vector3D, QuatType]:
+        """Get the world-frame pose of a site as (position, orientation quaternion [x,y,z,w])."""
+        quat = np.zeros(4)
+        with self._lock:
+            pos = np.array(self.data.site_xpos[site_id])
+            mujoco.mju_mat2Quat(quat, self.data.site_xmat[site_id])
+        return pos, wxyz_to_xyzw(quat)
+
+    # --- jacobian -----------------------------------------------------------
+
+    def _jacobian_from_data(self, data: mujoco.MjData, frame_name: str) -> np.ndarray:
+        jacp = np.zeros((3, self.model.nv))
+        jacr = np.zeros((3, self.model.nv))
+        if frame_name in self.link_name_to_id:
+            mujoco.mj_jacBody(self.model, data, jacp, jacr, self.link_name_to_id[frame_name])
+        elif frame_name in self.site_name_to_id:
+            mujoco.mj_jacSite(self.model, data, jacp, jacr, self.site_name_to_id[frame_name])
+        else:
+            raise KeyError(f"No link or site named '{frame_name}'.")
+        cols = self.actuated_joint_dof_adrs
+        return np.vstack([jacp[:, cols], jacr[:, cols]])
+
+    def get_jacobian(self, ee_link_name: str, joint_angles: np.ndarray = None) -> np.ndarray:
+        """Compute the 6xN geometric Jacobian (linear stacked over angular) for a frame.
+
+        The frame may be a link (body) name or a site name. Columns correspond to the actuated
+        joints, in ``actuated_joint_names`` order.
+
+        Args:
+            ee_link_name (str): Name of the link (body) or site to compute the Jacobian for.
+            joint_angles (np.ndarray, optional): Actuated-joint configuration to evaluate at.
+                Defaults to None (use the current configuration). Evaluated on a scratch copy so
+                the live state is not disturbed.
+
+        Returns:
+            np.ndarray: 6xN Jacobian matrix.
+        """
+        if joint_angles is None:
+            with self._lock:
+                return self._jacobian_from_data(self.data, ee_link_name)
+        with self._lock:
+            scratch = self._get_scratch_data()
+            scratch.qpos[:] = self.data.qpos
+            for i, name in enumerate(self.actuated_joint_names):
+                scratch.qpos[self.joint_name_to_info[name].qpos_adr] = joint_angles[i]
+            mujoco.mj_forward(self.model, scratch)
+            return self._jacobian_from_data(scratch, ee_link_name)
+
+    # --- dynamics -----------------------------------------------------------
+
+    def get_gravity_compensation_torques(self) -> np.ndarray:
+        """Joint torques that hold the robot static against gravity at the current configuration.
+
+        Computed as the bias force (``qfrc_bias``) evaluated at zero velocity and acceleration on
+        a scratch copy, i.e. the pure gravity term, per actuated joint (``actuated_joint_names``
+        order). Useful as a feedforward term for torque / impedance control.
+
+        Returns:
+            np.ndarray: Gravity-compensation torque per actuated joint.
+        """
+        with self._lock:
+            scratch = self._get_scratch_data()
+            scratch.qpos[:] = self.data.qpos
+            scratch.qvel[:] = 0.0
+            scratch.qacc[:] = 0.0
+            mujoco.mj_forward(self.model, scratch)
+            bias = np.array(scratch.qfrc_bias)
+        return np.array(
+            [bias[self.joint_name_to_info[n].dof_adr] for n in self.actuated_joint_names]
+        )
+
+    # --- state bundle -------------------------------------------------------
+
+    def get_robot_states(
+        self, actuated_joint_names: List[str] = None, ee_names: List[str] = None
+    ) -> MujocoRobotState:
+        """Get a consistent snapshot of common robot state.
+
+        Args:
+            actuated_joint_names (List[str], optional): Joints to include. Defaults to all.
+            ee_names (List[str], optional): End-effectors to report the order of. Defaults to all.
+
+        Returns:
+            MujocoRobotState: The state snapshot.
+        """
+        if actuated_joint_names is None:
+            actuated_joint_names = self.actuated_joint_names
+        if ee_names is None:
+            ee_names = self.ee_names
+        with self._lock:
+            joint_ids = self.get_joint_ids(actuated_joint_names)
+            base_pos, base_quat = self.get_base_pose()
+            base_lin, base_ang = self.get_base_velocity()
+            q, v, tau = self.get_joint_states(joint_ids)
+            return MujocoRobotState(
+                base_position=base_pos,
+                base_com_position=self.get_base_com_position(),
+                base_quaternion=base_quat,
+                base_velocity_linear=base_lin,
+                base_velocity_angular=base_ang,
+                actuated_joint_positions=q,
+                actuated_joint_velocities=v,
+                actuated_joint_torques=tau,
+                joint_order=list(actuated_joint_names),
+                ee_order=list(ee_names),
+            )
 
     # --- info ---------------------------------------------------------------
 
