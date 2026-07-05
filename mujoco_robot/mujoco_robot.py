@@ -406,9 +406,13 @@ class MujocoRobot(MujocoObject):
         self._viewer = None
         self._async_thread: Optional[threading.Thread] = None
         self._running: bool = False
-        # These are consumed by the control / cosmetics methods.
+        # Control state (consumed by the control methods and the per-step control hook).
         self._enable_torque_mode: bool = enable_torque_mode
         self._ghost_mode: bool = ghost_mode
+        self._in_torque_mode: bool = False
+        self._managed_targets: Dict[int, Tuple[Optional[float], float]] = {}
+        self.default_position_kp: float = 100.0
+        self.default_position_kd: float = 10.0
 
         if default_base_position is None:
             default_base_position = np.zeros(3)
@@ -433,6 +437,12 @@ class MujocoRobot(MujocoObject):
             self.reset_base_pose(self.default_start_pose[0], self.default_start_pose[1])
         self.reset_joints(self.actuated_joint_ids, self.default_joint_positions)
 
+        # Enter the initial control mode (position mode holds the current configuration).
+        if self._enable_torque_mode:
+            self.set_torque_control_mode()
+        else:
+            self.set_position_control_mode()
+
         if verbose:
             self._print_robot_info()
         if place_on_ground:
@@ -450,6 +460,7 @@ class MujocoRobot(MujocoObject):
         """Advance the simulation by one timestep (only in synchronous mode)."""
         if self.sync_mode:
             with self._lock:
+                self._apply_managed_control()
                 mujoco.mj_step(self.model, self.data)
                 if self._viewer is not None:
                     self._viewer.sync()
@@ -466,6 +477,7 @@ class MujocoRobot(MujocoObject):
             dt = float(self.model.opt.timestep)
             start = time.perf_counter()
             with self._lock:
+                self._apply_managed_control()
                 mujoco.mj_step(self.model, self.data)
                 if self._viewer is not None:
                     self._viewer.sync()
@@ -617,6 +629,218 @@ class MujocoRobot(MujocoObject):
                 break
             pos[2] += move_resolution
         self.default_start_pose[0] = pos
+
+    # --- control ------------------------------------------------------------
+
+    def set_position_control_mode(self):
+        """Switch to position control: model actuators are active and hold the current pose.
+
+        Position commands go to the model's actuators (``data.ctrl``); for any actuated joint
+        without an actuator a PD controller drives ``data.qfrc_applied`` each step.
+        """
+        with self._lock:
+            self.model.opt.disableflags &= ~int(mujoco.mjtDisableBit.mjDSBL_ACTUATION)
+            self.data.qfrc_applied[:] = 0.0
+            self._managed_targets.clear()
+            self._in_torque_mode = False
+            for name in self.actuated_joint_names:
+                info = self.joint_name_to_info[name]
+                if info.actuator_id is not None:
+                    self.data.ctrl[info.actuator_id] = self.data.qpos[info.qpos_adr]
+
+    def set_torque_control_mode(self):
+        """Switch to effort/torque control: model actuators are disabled.
+
+        The robot will not hold itself up unless torque commands are sent each control cycle.
+        Commands are applied via ``data.qfrc_applied``.
+        """
+        with self._lock:
+            self.model.opt.disableflags |= int(mujoco.mjtDisableBit.mjDSBL_ACTUATION)
+            self.data.ctrl[:] = 0.0
+            self.data.qfrc_applied[:] = 0.0
+            self._managed_targets.clear()
+            self._in_torque_mode = True
+
+    @property
+    def in_torque_mode(self) -> bool:
+        """Whether the robot is currently in effort/torque control mode."""
+        return self._in_torque_mode
+
+    def _apply_managed_control(self):
+        """Apply PD control (via qfrc_applied) for joints tracked without a model actuator.
+
+        Called under the lock immediately before each ``mj_step``. Does nothing when there are no
+        managed targets (e.g. when every actuated joint has a position actuator).
+        """
+        if not self._managed_targets:
+            return
+        kp, kd = self.default_position_kp, self.default_position_kd
+        for jid, (q_des, dq_des) in self._managed_targets.items():
+            info = self.joint_name_to_info[self.joint_id_to_name[jid]]
+            tau = kd * (dq_des - self.data.qvel[info.dof_adr])
+            if q_des is not None:
+                err = q_des - self.data.qpos[info.qpos_adr]
+                if jid in self.continuous_joint_ids:
+                    err = wrap_angle(err)
+                tau += kp * err
+            self.data.qfrc_applied[info.dof_adr] = tau
+
+    def _normalise_cmd(self, cmd, n: int) -> np.ndarray:
+        cmd = np.asarray(cmd, dtype=float)
+        return np.full(n, float(cmd)) if cmd.ndim == 0 else cmd
+
+    def set_joint_positions(
+        self, cmd: np.ndarray, actuated_joint_names: List[str] = None, vels: np.ndarray = None
+    ):
+        """Command target positions for the given actuated joints (position control).
+
+        Joints with a position actuator receive the target via ``data.ctrl``; joints without one
+        are driven toward the target by a PD controller on ``data.qfrc_applied`` each step.
+
+        Args:
+            cmd (np.ndarray): Target joint positions.
+            actuated_joint_names (List[str], optional): Joints to command, in the order of ``cmd``.
+                Defaults to all actuated joints.
+            vels (np.ndarray, optional): Optional target velocities (used by the PD fallback).
+        """
+        if actuated_joint_names is None:
+            actuated_joint_names = self.actuated_joint_names
+        cmd = self._normalise_cmd(cmd, len(actuated_joint_names))
+        with self._lock:
+            for i, name in enumerate(actuated_joint_names):
+                info = self.joint_name_to_info[name]
+                dq_des = float(vels[i]) if vels is not None else 0.0
+                if not self._in_torque_mode and info.actuator_id is not None:
+                    self.data.ctrl[info.actuator_id] = cmd[i]
+                    self._managed_targets.pop(info.joint_id, None)
+                else:
+                    self._managed_targets[info.joint_id] = (float(cmd[i]), dq_des)
+
+    def set_joint_velocities(self, cmd: np.ndarray, actuated_joint_names: List[str] = None):
+        """Command target velocities for the given actuated joints (velocity control).
+
+        Implemented as a damping PD toward the target velocity via ``data.qfrc_applied`` (gain
+        ``default_position_kd``), since MuJoCo models rarely ship velocity actuators.
+
+        Args:
+            cmd (np.ndarray): Target joint velocities.
+            actuated_joint_names (List[str], optional): Joints to command, in the order of ``cmd``.
+        """
+        if actuated_joint_names is None:
+            actuated_joint_names = self.actuated_joint_names
+        cmd = self._normalise_cmd(cmd, len(actuated_joint_names))
+        with self._lock:
+            for i, name in enumerate(actuated_joint_names):
+                info = self.joint_name_to_info[name]
+                self._managed_targets[info.joint_id] = (None, float(cmd[i]))
+
+    def set_joint_torques(self, cmd: np.ndarray, actuated_joint_names: List[str] = None):
+        """Command target torques/efforts for the given actuated joints (effort control).
+
+        Writes ``data.qfrc_applied`` directly; intended for use in torque control mode.
+
+        Args:
+            cmd (np.ndarray): Target joint torques.
+            actuated_joint_names (List[str], optional): Joints to command, in the order of ``cmd``.
+        """
+        if actuated_joint_names is None:
+            actuated_joint_names = self.actuated_joint_names
+        cmd = self._normalise_cmd(cmd, len(actuated_joint_names))
+        with self._lock:
+            for i, name in enumerate(actuated_joint_names):
+                info = self.joint_name_to_info[name]
+                self.data.qfrc_applied[info.dof_adr] = cmd[i]
+                self._managed_targets.pop(info.joint_id, None)
+
+    def set_joint_positions_delta(self, cmd: np.ndarray, actuated_joint_names: List[str] = None):
+        """Command a position increment relative to the current positions (experimental).
+
+        Args:
+            cmd (np.ndarray): Position deltas.
+            actuated_joint_names (List[str], optional): Joints to command, in the order of ``cmd``.
+        """
+        if actuated_joint_names is None:
+            actuated_joint_names = self.actuated_joint_names
+        current = self.get_actuated_joint_positions(actuated_joint_names)
+        self.set_joint_positions(
+            current + self._normalise_cmd(cmd, len(actuated_joint_names)), actuated_joint_names
+        )
+
+    def compute_joint_pd_error(
+        self,
+        joint_ids: List[int],
+        q_des: np.ndarray,
+        dq_des: np.ndarray,
+        Kp: float | np.ndarray,
+        Kd: float | np.ndarray,
+    ) -> np.ndarray:
+        """Compute a joint-space PD term: ``Kp * (q_des - q) + Kd * (dq_des - dq)``.
+
+        Continuous joints use the wrapped position error. A None target zeroes that term.
+
+        Args:
+            joint_ids (List[int]): Joints to compute the error for.
+            q_des (np.ndarray): Desired positions (or None to skip the position term).
+            dq_des (np.ndarray): Desired velocities (or None to skip the velocity term).
+            Kp (float | np.ndarray): Position gain(s).
+            Kd (float | np.ndarray): Velocity gain(s).
+
+        Returns:
+            np.ndarray: The PD term per joint.
+        """
+        q, dq, _ = self.get_joint_states(joint_ids)
+        p_term = np.zeros_like(q)
+        if q_des is not None:
+            p_term = Kp * (q_des - q)
+            if self.has_continuous_joints:
+                for n, jid in enumerate(joint_ids):
+                    if jid in self.continuous_joint_ids:
+                        kp_n = Kp[n] if np.ndim(Kp) else Kp
+                        p_term[n] = kp_n * wrap_angle(q_des[n] - q[n])
+        d_term = np.zeros_like(dq)
+        if dq_des is not None:
+            d_term = Kd * (dq_des - dq)
+        return p_term + d_term
+
+    def set_actuated_joint_commands(
+        self,
+        actuated_joint_names: List[str] = None,
+        q: float | np.ndarray = 0,
+        dq: float | np.ndarray = 0,
+        Kp: float | np.ndarray = 0,
+        Kd: float | np.ndarray = 0,
+        tau: float | np.ndarray = 0,
+    ):
+        """Send a position-velocity-torque + PD (PVT-PD) command.
+
+        In torque control mode the applied effort is ``Kp*(q - q_now) + Kd*(dq - dq_now) + tau``,
+        written to ``data.qfrc_applied``. In position control mode ``q`` is used as the position
+        target (and ``dq`` as an optional target velocity); the PD/feedforward terms are ignored
+        because the model's actuators close the loop.
+
+        Args:
+            actuated_joint_names (List[str], optional): Joints to command. Defaults to all.
+            q (float | np.ndarray, optional): Position command(s). Defaults to 0.
+            dq (float | np.ndarray, optional): Velocity command(s). Defaults to 0.
+            Kp (float | np.ndarray, optional): Stiffness gain(s). Defaults to 0.
+            Kd (float | np.ndarray, optional): Damping gain(s). Defaults to 0.
+            tau (float | np.ndarray, optional): Feedforward torque(s). Defaults to 0.
+        """
+        if actuated_joint_names is None:
+            actuated_joint_names = self.actuated_joint_names
+        joint_ids = self.get_joint_ids(actuated_joint_names)
+        if self._in_torque_mode:
+            tau_cmd = self.compute_joint_pd_error(joint_ids, q_des=q, dq_des=dq, Kp=Kp, Kd=Kd) + tau
+            with self._lock:
+                for i, jid in enumerate(joint_ids):
+                    info = self.joint_name_to_info[self.joint_id_to_name[jid]]
+                    self.data.qfrc_applied[info.dof_adr] = tau_cmd[i]
+                    self._managed_targets.pop(jid, None)
+        else:
+            vels = dq if np.ndim(dq) else None
+            self.set_joint_positions(q, actuated_joint_names=actuated_joint_names, vels=vels)
+
+    # --- scratch data (for off-simulation queries) -------------------------
 
     def _get_scratch_data(self) -> mujoco.MjData:
         """A reusable ``MjData`` for queries that must not disturb the live state."""
