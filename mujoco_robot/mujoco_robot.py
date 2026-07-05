@@ -14,9 +14,14 @@ conversion is needed or performed.
 
 from typing import Dict, List, Mapping, Optional, TypeAlias
 from dataclasses import dataclass
+import atexit
+import threading
+import time
 
 import numpy as np
 import mujoco
+
+from .utils.model_builder import build_model
 
 QuatType: TypeAlias = np.ndarray
 """Numpy array representing a quaternion in format [x,y,z,w] (scipy convention)."""
@@ -304,5 +309,309 @@ class MujocoObject:
 class MujocoRobot(MujocoObject):
     """Robot interface utility for a generic robot in MuJoCo.
 
-    Coming soon.
+    Loads a robot from an MJCF/URDF file (optionally wrapping it in a minimal world with a ground
+    plane and light) or wraps an existing ``(model, data)`` pair, and manages the simulation
+    lifecycle: stepping, gravity/timestep, an optional background stepping thread, an optional
+    passive viewer, and shutdown.
     """
+
+    def __init__(
+        self,
+        mjcf_path: str = None,
+        urdf_path: str = None,
+        model: mujoco.MjModel = None,
+        data: mujoco.MjData = None,
+        ee_names: List[str] = None,
+        ee_sites: List[str] = None,
+        run_async: bool = True,
+        use_fixed_base: bool = True,
+        default_joint_positions: List[float] = None,
+        place_on_ground: bool = True,
+        default_base_position: Vector3D = None,
+        default_base_orientation: QuatType = None,
+        enable_torque_mode: bool = False,
+        verbose: bool = True,
+        load_ground_plane: bool = True,
+        ghost_mode: bool = False,
+        render: bool = False,
+    ):
+        """Create a robot interface. Does not start the visualiser by default.
+
+        Args:
+            mjcf_path (str, optional): Path to an MJCF file to load (preferred).
+            urdf_path (str, optional): Path to a URDF file to load (best-effort).
+            model (mujoco.MjModel, optional): An already-compiled model to wrap. Takes precedence
+                over the path arguments; no world-building is applied to it.
+            data (mujoco.MjData, optional): Existing state to wrap. A fresh ``MjData`` is created
+                if not provided.
+            ee_names (List[str], optional): End-effector body names.
+            ee_sites (List[str], optional): Optional site names to use as end-effector frames
+                (overrides the body frame for those end-effectors when reading poses/jacobians).
+            run_async (bool, optional): Step physics in a background thread. If False, call
+                ``step()`` manually. Defaults to True.
+            use_fixed_base (bool, optional): Fixed (True) or floating (False) base. Only applied
+                when loading from a path. Defaults to True.
+            default_joint_positions (List[float], optional): Initial actuated-joint positions
+                (in ``actuated_joint_names`` order). Defaults to zeros.
+            place_on_ground (bool, optional): Raise the base until the robot is not penetrating the
+                ground. Defaults to True.
+            default_base_position (Vector3D, optional): Initial base position. Defaults to zeros.
+            default_base_orientation (QuatType, optional): Initial base orientation quaternion
+                [x,y,z,w]. Defaults to identity.
+            enable_torque_mode (bool, optional): Start in effort/torque control mode. Defaults to
+                False.
+            verbose (bool, optional): Print a robot info summary on construction. Defaults to True.
+            load_ground_plane (bool, optional): Add a ground plane + light when loading from a
+                path. Defaults to True.
+            ghost_mode (bool, optional): Make the robot collision-free and translucent. Defaults
+                to False.
+            render (bool, optional): Launch a passive viewer on construction (needs a display).
+                Defaults to False.
+        """
+        if model is None:
+            if mjcf_path is None and urdf_path is None:
+                raise ValueError("Provide one of: model, mjcf_path, urdf_path.")
+            model = build_model(
+                mjcf_path=mjcf_path,
+                urdf_path=urdf_path,
+                use_fixed_base=use_fixed_base,
+                load_ground_plane=load_ground_plane,
+            )
+        super().__init__(model)
+        self.data: mujoco.MjData = data if data is not None else mujoco.MjData(self.model)
+
+        self.sync_mode: bool = not run_async
+        self._lock = threading.RLock()
+        self._viewer = None
+        self._async_thread: Optional[threading.Thread] = None
+        self._running: bool = False
+        # These are consumed by the control / cosmetics methods.
+        self._enable_torque_mode: bool = enable_torque_mode
+        self._ghost_mode: bool = ghost_mode
+
+        if default_base_position is None:
+            default_base_position = np.zeros(3)
+        if default_base_orientation is None:
+            default_base_orientation = np.array([0.0, 0.0, 0.0, 1.0])
+        self.default_start_pose = [
+            np.array(default_base_position, dtype=float),
+            np.array(default_base_orientation, dtype=float),
+        ]
+
+        self.ee_names: List[str] = list(ee_names) if ee_names else []
+        self.ee_sites: List[str] = list(ee_sites) if ee_sites else []
+        self.ee_ids: List[int] = [self.get_link_id(n) for n in self.ee_names]
+        self.ee_site_ids: List[int] = [self.get_site_id(n) for n in self.ee_sites]
+
+        if default_joint_positions is not None:
+            self.default_joint_positions = np.asarray(default_joint_positions, dtype=float)
+        else:
+            self.default_joint_positions = np.zeros(self.num_actuated_joints)
+
+        if self.has_floating_base:
+            self.reset_base_pose(self.default_start_pose[0], self.default_start_pose[1])
+        self.reset_joints(self.actuated_joint_ids, self.default_joint_positions)
+
+        if verbose:
+            self._print_robot_info()
+        if place_on_ground:
+            self._place_robot_on_ground()
+        if render:
+            self.launch_viewer()
+        if run_async:
+            self._start_async()
+
+        atexit.register(self.shutdown)
+
+    # --- simulation lifecycle ----------------------------------------------
+
+    def step(self):
+        """Advance the simulation by one timestep (only in synchronous mode)."""
+        if self.sync_mode:
+            with self._lock:
+                mujoco.mj_step(self.model, self.data)
+                if self._viewer is not None:
+                    self._viewer.sync()
+
+    def _start_async(self):
+        if self._running:
+            return
+        self._running = True
+        self._async_thread = threading.Thread(target=self._async_loop, daemon=True)
+        self._async_thread.start()
+
+    def _async_loop(self):
+        while self._running:
+            dt = float(self.model.opt.timestep)
+            start = time.perf_counter()
+            with self._lock:
+                mujoco.mj_step(self.model, self.data)
+                if self._viewer is not None:
+                    self._viewer.sync()
+            time.sleep(max(0.0, dt - (time.perf_counter() - start)))
+
+    def _stop_async(self):
+        self._running = False
+        thread = self._async_thread
+        if thread is not None and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout=1.0)
+        self._async_thread = None
+
+    def launch_viewer(self):
+        """Launch a passive MuJoCo viewer (requires a display). Returns the viewer handle."""
+        import mujoco.viewer  # imported lazily so headless use never touches OpenGL
+
+        if self._viewer is None:
+            self._viewer = mujoco.viewer.launch_passive(self.model, self.data)
+        return self._viewer
+
+    def is_viewer_running(self) -> bool:
+        """Whether a passive viewer is currently open."""
+        return self._viewer is not None and self._viewer.is_running()
+
+    def shutdown(self):
+        """Stop the background thread (if any) and close the viewer (if any)."""
+        self._stop_async()
+        if self._viewer is not None:
+            try:
+                self._viewer.close()
+            except Exception:  # noqa: BLE001 - viewer may already be gone
+                pass
+            self._viewer = None
+
+    # --- world / timestep / gravity ----------------------------------------
+
+    def get_timestep(self) -> float:
+        """Get the physics timestep (seconds)."""
+        return float(self.model.opt.timestep)
+
+    def set_timestep(self, dt: float):
+        """Set the physics timestep (seconds)."""
+        self.model.opt.timestep = dt
+
+    def get_gravity(self) -> Vector3D:
+        """Get the gravity vector."""
+        return np.array(self.model.opt.gravity)
+
+    def set_gravity(self, gravity: Vector3D):
+        """Set the gravity vector."""
+        self.model.opt.gravity[:] = np.asarray(gravity, dtype=float)
+
+    # --- resets -------------------------------------------------------------
+
+    def reset_joints(
+        self,
+        joint_ids: List[int],
+        joint_positions: np.ndarray,
+        joint_velocities: np.ndarray = None,
+    ):
+        """Set the positions (and optionally velocities) of the given (1-dof) joints.
+
+        Writes ``qpos``/``qvel`` directly and recomputes derived quantities with ``mj_forward``
+        (no dynamics stepping). Assumes 1-dof (hinge/slide) joints, as is the case for actuated
+        joints.
+
+        Args:
+            joint_ids (List[int]): Joint ids to set.
+            joint_positions (np.ndarray): Target positions, aligned with ``joint_ids``.
+            joint_velocities (np.ndarray, optional): Target velocities. Defaults to zeros.
+        """
+        joint_positions = np.asarray(joint_positions, dtype=float)
+        with self._lock:
+            for n, jid in enumerate(joint_ids):
+                info = self.joint_name_to_info[self.joint_id_to_name[jid]]
+                self.data.qpos[info.qpos_adr] = joint_positions[n]
+                if joint_velocities is not None:
+                    self.data.qvel[info.dof_adr] = joint_velocities[n]
+                elif info.dof_dim == 1:
+                    self.data.qvel[info.dof_adr] = 0.0
+            mujoco.mj_forward(self.model, self.data)
+
+    def reset_base_pose(
+        self,
+        position: Vector3D = None,
+        orientation: QuatType = None,
+        base_linear_velocity: Vector3D = None,
+        base_angular_velocity: Vector3D = None,
+    ):
+        """Set the base pose (and optionally base velocity for a floating base).
+
+        For a floating base this writes the free-joint ``qpos``/``qvel``. For a fixed base it
+        offsets the root body's placement in the model (``body_pos``/``body_quat``). Either way,
+        ``mj_forward`` is called afterwards.
+
+        Args:
+            position (Vector3D, optional): Base position. Defaults to the stored start position.
+            orientation (QuatType, optional): Base orientation quaternion [x,y,z,w]. Defaults to
+                the stored start orientation.
+            base_linear_velocity (Vector3D, optional): Floating-base linear velocity. Defaults to
+                zeros. Ignored for a fixed base.
+            base_angular_velocity (Vector3D, optional): Floating-base angular velocity. Defaults
+                to zeros. Ignored for a fixed base.
+        """
+        if position is None:
+            position = self.default_start_pose[0]
+        if orientation is None:
+            orientation = self.default_start_pose[1]
+        position = np.asarray(position, dtype=float)
+        with self._lock:
+            if self.has_floating_base:
+                info = self.joint_name_to_info[self.joint_id_to_name[self.free_joint_id]]
+                a, d = info.qpos_adr, info.dof_adr
+                self.data.qpos[a : a + 3] = position
+                self.data.qpos[a + 3 : a + 7] = xyzw_to_wxyz(orientation)
+                self.data.qvel[d : d + 3] = (
+                    np.zeros(3) if base_linear_velocity is None else base_linear_velocity
+                )
+                self.data.qvel[d + 3 : d + 6] = (
+                    np.zeros(3) if base_angular_velocity is None else base_angular_velocity
+                )
+            else:
+                self.model.body_pos[self.base_id] = position
+                self.model.body_quat[self.base_id] = xyzw_to_wxyz(orientation)
+            mujoco.mj_forward(self.model, self.data)
+
+    # --- placement ----------------------------------------------------------
+
+    def _ground_geom_ids(self) -> set:
+        plane = int(mujoco.mjtGeom.mjGEOM_PLANE)
+        return {i for i in range(self.model.ngeom) if int(self.model.geom_type[i]) == plane}
+
+    def _touching_ground(self, ground_ids: set) -> bool:
+        for c in range(self.data.ncon):
+            con = self.data.contact[c]
+            if con.geom1 in ground_ids or con.geom2 in ground_ids:
+                return True
+        return False
+
+    def _place_robot_on_ground(self, move_resolution: float = 0.01, max_iters: int = 1000):
+        ground_ids = self._ground_geom_ids()
+        if not ground_ids:
+            return
+        pos = np.array(self.default_start_pose[0], dtype=float)
+        pos[2] = 0.0
+        for _ in range(max_iters):
+            self.reset_base_pose(position=pos, orientation=self.default_start_pose[1])
+            if not self._touching_ground(ground_ids):
+                break
+            pos[2] += move_resolution
+        self.default_start_pose[0] = pos
+
+    # --- info ---------------------------------------------------------------
+
+    def _print_robot_info(self):
+        bar = "*" * 80
+        print(f"\n{bar}\nMujocoRobot Info\n{bar}")
+        print(f"  name:               {self.name}")
+        print(f"  total mass:         {self.mass:.4f}")
+        print(f"  base link:          {self.base_name}")
+        print(f"  floating base:      {self.has_floating_base}")
+        print(f"  has actuators:      {self.has_actuators}")
+        print(f"  links ({len(self.link_names)}):           {self.link_names}")
+        print(f"  actuated joints ({self.num_actuated_joints}): {self.actuated_joint_names}")
+        print(f"  lower limits:       {np.round(self.actuated_joint_lower_limits, 3).tolist()}")
+        print(f"  upper limits:       {np.round(self.actuated_joint_upper_limits, 3).tolist()}")
+        print(f"  continuous joints:  {self.continuous_joint_names}")
+        print(f"  end-effectors:      {self.ee_names}")
+        print(f"  timestep:           {self.get_timestep()}")
+        print(f"{bar}\n")
