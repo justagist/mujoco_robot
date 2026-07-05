@@ -9,3 +9,7 @@ Coming soon.
 """
 
 # Coming soon: wrap_in_world(), set_base_freejoint(), etc.
+#
+# NOTE: MjSpec's compiler defaults to degrees (mujoco.MjSpec().compiler.degree is True). When
+# building or modifying a model here, set spec.compiler.degree = False (or use unit-free
+# quaternions / axis vectors) so any angle literals are radians, matching the radian public API.

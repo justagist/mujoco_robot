@@ -33,6 +33,8 @@ pytest -q
 
 - **Quaternions:** the external API uses `[x, y, z, w]` (scipy convention); values are converted to
   MuJoCo's `[w, x, y, z]` only at the boundary.
+- **Angles:** joint positions, velocities, and limits are in radians. A compiled model always
+  stores radians regardless of the MJCF `compiler angle` setting, so no conversion is done.
 - **Backend:** pure `MjModel` + `MjData` (no client-server). Pass an existing `(model, data)` to
   wrap a robot that is already part of a scene.
 - **End-effector frame:** a body by default; a site can be used optionally.
