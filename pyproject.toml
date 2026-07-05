@@ -1,0 +1,62 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mujoco_robot"
+version = "0.0.1"
+description = "A general Python interface class for robot simulations using MuJoCo."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+authors = [{ name = "Saif Sidhik", email = "mail@saifsidhik.page" }]
+keywords = [
+    "mujoco",
+    "robotics",
+    "simulation",
+    "inverse kinematics",
+    "robot control",
+    "python",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Scientific/Engineering",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+dependencies = [
+    "robot-descriptions>=2.0,<3",
+    "numpy>=1.24,<3",
+    "scipy>=1.14,<2",
+    "mujoco>=3.2",
+]
+
+[project.optional-dependencies]
+test = ["pytest"]
+dev = ["pytest", "ruff", "build"]
+
+[project.urls]
+Homepage = "https://github.com/justagist/mujoco_robot"
+"Bug Tracker" = "https://github.com/justagist/mujoco_robot/issues"
+Documentation = "https://github.com/justagist/mujoco_robot/blob/main/README.md"
+"Source Code" = "https://github.com/justagist/mujoco_robot"
+
+[tool.setuptools.packages.find]
+include = ["mujoco_robot*"]
+
+[tool.setuptools.package-data]
+mujoco_robot = ["py.typed"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

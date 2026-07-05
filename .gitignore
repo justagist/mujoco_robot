@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# MuJoCo / robot_descriptions caches (usually under ~/.cache, but ignore any local ones)
+*.mjb
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/

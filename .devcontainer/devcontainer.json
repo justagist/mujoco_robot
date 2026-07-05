@@ -1,0 +1,19 @@
+{
+  "name": "mujoco_robot",
+  "image": "mcr.microsoft.com/devcontainers/python:3.12",
+  "features": {
+    "ghcr.io/devcontainers/features/git:1": {}
+  },
+  "postCreateCommand": "pip install -e '.[dev]'",
+  "containerEnv": {
+    "MUJOCO_GL": "egl"
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "charliermarsh.ruff"
+      ]
+    }
+  }
+}
