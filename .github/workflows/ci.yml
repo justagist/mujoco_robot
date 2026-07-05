@@ -29,7 +29,5 @@ jobs:
       - name: Lint (ruff)
         run: ruff check .
 
-      - name: Test (pytest, headless MuJoCo)
-        env:
-          MUJOCO_GL: egl
+      - name: Test (pytest)
         run: pytest -q
