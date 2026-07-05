@@ -150,6 +150,8 @@ class MujocoRobotState:
     """Actuated-joint names, in the order the joint arrays are given."""
     ee_order: List[str]
     """End-effector names reported."""
+    ee_contact_states: np.ndarray
+    """Binary contact state (1 = in contact, 0 = not), aligned with ee_order."""
 
 
 class MujocoObject:
@@ -182,6 +184,9 @@ class MujocoObject:
         )
         self.geom_names, self.geom_name_to_id, self.geom_id_to_name = _id_name_maps(
             model, obj.mjOBJ_GEOM, model.ngeom
+        )
+        self.sensor_names, self.sensor_name_to_id, self.sensor_id_to_name = _id_name_maps(
+            model, obj.mjOBJ_SENSOR, model.nsensor
         )
 
         # Links are bodies, excluding the world body (id 0).
@@ -354,6 +359,7 @@ class MujocoRobot(MujocoObject):
         verbose: bool = True,
         load_ground_plane: bool = True,
         ghost_mode: bool = False,
+        ft_sensor_links: List[str] = None,
         render: bool = False,
     ):
         """Create a robot interface. Does not start the visualiser by default.
@@ -386,6 +392,9 @@ class MujocoRobot(MujocoObject):
                 path. Defaults to True.
             ghost_mode (bool, optional): Make the robot collision-free and translucent. Defaults
                 to False.
+            ft_sensor_links (List[str], optional): Bodies to instrument with force-torque sensors
+                (compile-time; only applied when loading from a path). Read with
+                ``get_link_ft_measurement``.
             render (bool, optional): Launch a passive viewer on construction (needs a display).
                 Defaults to False.
         """
@@ -397,6 +406,7 @@ class MujocoRobot(MujocoObject):
                 urdf_path=urdf_path,
                 use_fixed_base=use_fixed_base,
                 load_ground_plane=load_ground_plane,
+                ft_sensor_links=ft_sensor_links,
             )
         super().__init__(model)
         self.data: mujoco.MjData = data if data is not None else mujoco.MjData(self.model)
@@ -427,6 +437,12 @@ class MujocoRobot(MujocoObject):
         self.ee_sites: List[str] = list(ee_sites) if ee_sites else []
         self.ee_ids: List[int] = [self.get_link_id(n) for n in self.ee_names]
         self.ee_site_ids: List[int] = [self.get_site_id(n) for n in self.ee_sites]
+
+        # Force-torque sensors that were actually compiled into the model (see ft_sensor_links).
+        self.ft_sensor_links: List[str] = [
+            name for name in (ft_sensor_links or []) if f"{name}_force" in self.sensor_name_to_id
+        ]
+        self._ft_enabled_links: set = set(self.ft_sensor_links)
 
         if default_joint_positions is not None:
             self.default_joint_positions = np.asarray(default_joint_positions, dtype=float)
@@ -501,6 +517,11 @@ class MujocoRobot(MujocoObject):
     def is_viewer_running(self) -> bool:
         """Whether a passive viewer is currently open."""
         return self._viewer is not None and self._viewer.is_running()
+
+    @property
+    def viewer(self):
+        """The passive viewer handle (or None if not launched)."""
+        return self._viewer
 
     def shutdown(self):
         """Stop the background thread (if any) and close the viewer (if any)."""
@@ -1050,7 +1071,152 @@ class MujocoRobot(MujocoObject):
                 actuated_joint_torques=tau,
                 joint_order=list(actuated_joint_names),
                 ee_order=list(ee_names),
+                ee_contact_states=self.get_ee_contact_states(ee_names),
             )
+
+    # --- contacts -----------------------------------------------------------
+
+    def get_contact_states_of_links(self, link_ids: List[int]) -> np.ndarray:
+        """Binary contact state (1 = in contact, 0 = not) for each of the given links (bodies).
+
+        Args:
+            link_ids (List[int]): Body ids to query.
+
+        Returns:
+            np.ndarray: One 0/1 value per link, in the given order.
+        """
+        with self._lock:
+            touching = set()
+            for c in range(self.data.ncon):
+                con = self.data.contact[c]
+                touching.add(int(self.model.geom_bodyid[con.geom1]))
+                touching.add(int(self.model.geom_bodyid[con.geom2]))
+        return np.array([int(lid in touching) for lid in link_ids])
+
+    def get_ee_contact_states(self, ee_names: List[str] = None) -> np.ndarray:
+        """Binary contact state for the given end-effectors (defaults to the configured ones)."""
+        if ee_names is None:
+            ee_names = self.ee_names
+        return self.get_contact_states_of_links([self.get_link_id(n) for n in ee_names])
+
+    def get_link_contact_force(self, link) -> Vector3D:
+        """Net world-frame contact force acting on the given link (body).
+
+        Sums each contact's force (from ``mj_contactForce``, rotated into the world frame) over the
+        contacts that involve the link, with the sign chosen so the result is the force ON the
+        link. Zero if the link has no contacts.
+
+        Args:
+            link (int | str): Link (body) id or name.
+
+        Returns:
+            Vector3D: Net contact force in the world frame.
+        """
+        lid = link if isinstance(link, (int, np.integer)) else self.get_link_id(link)
+        net = np.zeros(3)
+        f6 = np.zeros(6)
+        with self._lock:
+            for c in range(self.data.ncon):
+                con = self.data.contact[c]
+                b1 = int(self.model.geom_bodyid[con.geom1])
+                b2 = int(self.model.geom_bodyid[con.geom2])
+                if lid not in (b1, b2):
+                    continue
+                mujoco.mj_contactForce(self.model, self.data, c, f6)
+                frame = con.frame
+                fw = f6[0] * frame[0:3] + f6[1] * frame[3:6] + f6[2] * frame[6:9]
+                net += fw if lid == b2 else -fw
+        return net
+
+    # --- force-torque sensors -----------------------------------------------
+
+    def has_ft_sensor(self, link_name: str) -> bool:
+        """Whether a force-torque sensor was compiled in for the given link."""
+        return f"{link_name}_force" in self.sensor_name_to_id
+
+    def _read_sensor(self, name: str) -> np.ndarray:
+        sid = self.sensor_name_to_id[name]
+        adr = int(self.model.sensor_adr[sid])
+        dim = int(self.model.sensor_dim[sid])
+        return np.array(self.data.sensordata[adr : adr + dim])
+
+    def get_link_ft_measurement(self, link_name: str) -> np.ndarray:
+        """Force-torque reading for a link as a 6D wrench ``[fx,fy,fz,tx,ty,tz]`` (site frame).
+
+        Returns zeros if the link has no force-torque sensor (see ``ft_sensor_links``) or its
+        sensor has been disabled via ``toggle_ft_sensor_for_links``.
+        """
+        if link_name not in self._ft_enabled_links or not self.has_ft_sensor(link_name):
+            return np.zeros(6)
+        with self._lock:
+            force = self._read_sensor(f"{link_name}_force")
+            torque = self._read_sensor(f"{link_name}_torque")
+        return np.concatenate([force, torque])
+
+    def get_joint_ft_measurements(self, joint_ids: List[int] = None) -> np.ndarray:
+        """Force-torque wrench transmitted at each joint (measured at the joint's child link).
+
+        Args:
+            joint_ids (List[int], optional): Joints to query. Defaults to all actuated joints.
+
+        Returns:
+            np.ndarray: An (N, 6) array of ``[fx,fy,fz,tx,ty,tz]`` per joint (zeros where no
+                sensor is present).
+        """
+        if joint_ids is None:
+            joint_ids = self.actuated_joint_ids
+        out = np.zeros((len(joint_ids), 6))
+        for i, jid in enumerate(joint_ids):
+            link_name = self.body_id_to_name[int(self.model.jnt_bodyid[jid])]
+            out[i] = self.get_link_ft_measurement(link_name)
+        return out
+
+    def get_full_joint_states(
+        self, joint_ids: List[int] = None
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Get joint positions, velocities, force-torque measurements, and efforts.
+
+        Args:
+            joint_ids (List[int], optional): Joints to read. Defaults to all actuated joints.
+
+        Returns:
+            Tuple: (positions, velocities, (N,6) force-torque measurements, efforts).
+        """
+        q, v, tau = self.get_joint_states(joint_ids)
+        ft = self.get_joint_ft_measurements(joint_ids)
+        return q, v, ft, tau
+
+    def toggle_ft_sensor_for_links(self, link_names, enable: bool = True):
+        """Enable/disable reading of the (compile-time) force-torque sensors for the given links.
+
+        MuJoCo sensors cannot be added or removed at runtime; this only gates whether the getters
+        return the sensor value or zeros. Declare the sensors up front with ``ft_sensor_links``.
+
+        Args:
+            link_names (str | List[str]): Link name(s).
+            enable (bool, optional): True to read, False to return zeros. Defaults to True.
+        """
+        if isinstance(link_names, str):
+            link_names = [link_names]
+        for name in link_names:
+            if enable and self.has_ft_sensor(name):
+                self._ft_enabled_links.add(name)
+            else:
+                self._ft_enabled_links.discard(name)
+
+    def toggle_ft_sensor_for_joints(self, joint_ids, enable: bool = True):
+        """Enable/disable the force-torque sensors at the given joints' child links.
+
+        See ``toggle_ft_sensor_for_links``; sensors are compile-time, so this only gates reading.
+
+        Args:
+            joint_ids (int | List[int]): Joint id(s).
+            enable (bool, optional): True to read, False to return zeros. Defaults to True.
+        """
+        if isinstance(joint_ids, (int, np.integer)):
+            joint_ids = [joint_ids]
+        links = [self.body_id_to_name[int(self.model.jnt_bodyid[j])] for j in joint_ids]
+        self.toggle_ft_sensor_for_links(links, enable)
 
     # --- info ---------------------------------------------------------------
 

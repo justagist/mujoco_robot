@@ -11,6 +11,8 @@ angle literals. If you add angle literals (euler / joint range), set ``spec.comp
 False`` first so they are treated as radians, matching the radian public API.
 """
 
+from typing import Sequence
+
 import mujoco
 
 _FREE = int(mujoco.mjtJoint.mjJNT_FREE)
@@ -71,25 +73,76 @@ def add_light(spec: mujoco.MjSpec):
     light.dir = [0.0, 0.0, -1.0]
 
 
+def add_box(spec: mujoco.MjSpec, name, pos, half_size, rgba=(0.6, 0.4, 0.25, 1.0)):
+    """Add a static (world-fixed) box geom to the world, e.g. a table or an obstacle.
+
+    Args:
+        spec (mujoco.MjSpec): The editable model spec.
+        name (str): Geom name.
+        pos (Sequence[float]): World-frame centre position [x, y, z].
+        half_size (Sequence[float]): Box half-extents [x, y, z].
+        rgba (Sequence[float], optional): Colour. Defaults to a brown.
+    """
+    geom = spec.worldbody.add_geom()
+    geom.name = name
+    geom.type = mujoco.mjtGeom.mjGEOM_BOX
+    geom.pos = list(pos)
+    geom.size = list(half_size)
+    geom.rgba = list(rgba)
+
+
+def add_ft_sensors(spec: mujoco.MjSpec, link_names: Sequence[str]):
+    """Attach a force + torque sensor (on a new site) to each named body.
+
+    MuJoCo sensors are compile-time, so force-torque sensing must be declared before compilation.
+    Each link ``L`` gets a site ``L_ft_site`` and sensors ``L_force`` / ``L_torque`` that measure
+    the interaction wrench transmitted through that site (in the site frame).
+
+    Args:
+        spec (mujoco.MjSpec): The editable model spec.
+        link_names (Sequence[str]): Names of bodies to instrument.
+    """
+    bodies = {b.name: b for b in spec.bodies}
+    for link in link_names:
+        if link not in bodies:
+            raise ValueError(f"No body named '{link}' to attach a force-torque sensor to.")
+        site_name = f"{link}_ft_site"
+        site = bodies[link].add_site()
+        site.name = site_name
+        for stype, suffix in (
+            (mujoco.mjtSensor.mjSENS_FORCE, "force"),
+            (mujoco.mjtSensor.mjSENS_TORQUE, "torque"),
+        ):
+            sensor = spec.add_sensor()
+            sensor.name = f"{link}_{suffix}"
+            sensor.type = stype
+            sensor.objtype = mujoco.mjtObj.mjOBJ_SITE
+            sensor.objname = site_name
+
+
 def build_model(
     mjcf_path: str = None,
     urdf_path: str = None,
     use_fixed_base: bool = True,
     load_ground_plane: bool = True,
+    ft_sensor_links: Sequence[str] = None,
 ) -> mujoco.MjModel:
-    """Load a description, set the base, optionally add a ground plane + light, and compile.
+    """Load a description, set the base, optionally add a ground plane + FT sensors, and compile.
 
     Args:
         mjcf_path (str): Path to an MJCF file (preferred).
         urdf_path (str): Path to a URDF file (best-effort; MuJoCo URDF has no actuators/sensors).
         use_fixed_base (bool): Whether the robot base is fixed (True) or floating (False).
         load_ground_plane (bool): Whether to add a ground plane + light.
+        ft_sensor_links (Sequence[str], optional): Bodies to instrument with force-torque sensors.
 
     Returns:
         mujoco.MjModel: The compiled model.
     """
     spec = load_spec(mjcf_path=mjcf_path, urdf_path=urdf_path)
     set_base_fixed(spec, use_fixed_base)
+    if ft_sensor_links:
+        add_ft_sensors(spec, ft_sensor_links)
     if load_ground_plane:
         add_ground_plane(spec)
         add_light(spec)
