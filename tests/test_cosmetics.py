@@ -2,12 +2,10 @@
 
 Physics only, no rendering.
 """
-
-import mujoco
 import numpy as np
 import pytest
 
-from mujoco_robot import MujocoRobot, viewer_utils
+from mujoco_robot import MujocoRobot
 from mujoco_robot.utils.robot_loader_utils import get_mjcf_from_awesome_robot_descriptions
 
 PANDA = get_mjcf_from_awesome_robot_descriptions("panda_mj_description")
