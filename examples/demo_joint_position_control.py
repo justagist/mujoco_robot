@@ -1,6 +1,6 @@
 """Joint-space position control demo for mujoco_robot.
 
-Loads a Franka Panda, prints its structure, and drives the arm along a smooth sinusoidal joint
+Loads a KUKA iiwa14, prints its structure, and drives the arm along a smooth sinusoidal joint
 trajectory using position control. A passive viewer shows the motion (unless ``--headless``).
 
 Run:
@@ -16,16 +16,16 @@ import numpy as np
 from mujoco_robot import MujocoRobot
 from mujoco_robot.utils.robot_loader_utils import get_mjcf_from_awesome_robot_descriptions
 
-# A valid within-limits "ready" configuration (7 arm joints + 2 fingers).
-NEUTRAL = [0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785, 0.02, 0.02]
+# iiwa14 "home" keyframe (7 revolute joints; no gripper).
+HOME = [0.0, 0.785, 0.0, -1.571, 0.0, 0.0, 0.0]
 ARM = [f"joint{i}" for i in range(1, 8)]
 
 
 def main(render: bool = True, duration: float = None):
     robot = MujocoRobot(
-        mjcf_path=get_mjcf_from_awesome_robot_descriptions("panda_mj_description"),
-        ee_names=["hand"],
-        default_joint_positions=NEUTRAL,
+        mjcf_path=get_mjcf_from_awesome_robot_descriptions("iiwa14_mj_description"),
+        ee_names=["link7"],
+        default_joint_positions=HOME,
         run_async=False,  # step the simulation manually in the loop below
         place_on_ground=False,
         load_ground_plane=True,
@@ -35,8 +35,8 @@ def main(render: bool = True, duration: float = None):
     robot.set_position_control_mode()
 
     home = robot.get_actuated_joint_positions(ARM).copy()
-    amplitude = np.deg2rad([20, 15, 20, 15, 25, 20, 30])  # per-joint amplitude (radians)
-    frequency = 0.25  # Hz
+    amplitude = np.deg2rad([30, 25, 40, 35, 45, 40, 60])  # per-joint amplitude (radians)
+    frequency = 0.2  # Hz
     dt = robot.get_timestep()
 
     def keep_running(elapsed: float) -> bool:

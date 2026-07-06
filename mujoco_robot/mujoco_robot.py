@@ -585,6 +585,27 @@ class MujocoRobot(MujocoObject):
                     self.data.qvel[info.dof_adr] = 0.0
             mujoco.mj_forward(self.model, self.data)
 
+    def reset_actuated_joint_positions(
+        self,
+        joint_positions: np.ndarray = None,
+        joint_names: List[str] = None,
+        joint_velocities: np.ndarray = None,
+    ):
+        """Reset the actuated joints to the given positions (no controller; ``qpos`` + forward).
+
+        Args:
+            joint_positions (np.ndarray, optional): Target positions, in the order of
+                ``joint_names``. Defaults to ``default_joint_positions``.
+            joint_names (List[str], optional): Joints to set, in the order of ``joint_positions``.
+                Defaults to all actuated joints.
+            joint_velocities (np.ndarray, optional): Target velocities. Defaults to zeros.
+        """
+        if joint_positions is None:
+            joint_positions = self.default_joint_positions
+        if joint_names is None:
+            joint_names = self.actuated_joint_names
+        self.reset_joints(self.get_joint_ids(joint_names), joint_positions, joint_velocities)
+
     def reset_base_pose(
         self,
         position: Vector3D = None,

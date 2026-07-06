@@ -91,6 +91,27 @@ def add_box(spec: mujoco.MjSpec, name, pos, half_size, rgba=(0.6, 0.4, 0.25, 1.0
     geom.rgba = list(rgba)
 
 
+def add_site(spec: mujoco.MjSpec, body_name: str, site_name: str, pos=(0.0, 0.0, 0.0)):
+    """Attach a named site (a frame) to a body, e.g. an IK / tool target frame.
+
+    Args:
+        spec (mujoco.MjSpec): The editable model spec.
+        body_name (str): Body to attach the site to.
+        site_name (str): Name for the new site.
+        pos (Sequence[float], optional): Site position in the body frame. Defaults to the origin.
+
+    Returns:
+        str: The site name.
+    """
+    body = next((b for b in spec.bodies if b.name == body_name), None)
+    if body is None:
+        raise ValueError(f"No body named '{body_name}' to attach a site to.")
+    site = body.add_site()
+    site.name = site_name
+    site.pos = list(pos)
+    return site_name
+
+
 def add_ft_sensors(spec: mujoco.MjSpec, link_names: Sequence[str]):
     """Attach a force + torque sensor (on a new site) to each named body.
 

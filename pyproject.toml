@@ -40,6 +40,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Optional whole-body / multi-frame IK backend (used by examples/demo_mink_wholebody_ik.py).
+# The core install and the differential_ik helper do NOT require mink.
+ik = ["mink>=1.1"]
 test = ["pytest"]
 dev = ["pytest", "ruff", "build"]
 
