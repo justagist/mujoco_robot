@@ -14,9 +14,11 @@ conversion is needed or performed.
 
 from typing import Dict, List, Mapping, Optional, Tuple, TypeAlias
 from dataclasses import dataclass
+from collections import deque
 import atexit
 import threading
 import time
+import warnings
 
 import numpy as np
 import mujoco
@@ -152,6 +154,18 @@ class MujocoRobotState:
     """End-effector names reported."""
     ee_contact_states: np.ndarray
     """Binary contact state (1 = in contact, 0 = not), aligned with ee_order."""
+
+
+@dataclass
+class ContactInfo:
+    """Detailed information about a single active contact (see ``get_contact_info``)."""
+
+    pos: Vector3D
+    """Contact point in the world frame."""
+    frame: np.ndarray
+    """3x3 contact frame; rows are the contact axes in world coordinates (row 0 = normal / x)."""
+    wrench: np.ndarray
+    """6D contact wrench [force(3), torque(3)] in the contact frame (from ``mj_contactForce``)."""
 
 
 class MujocoObject:
@@ -365,6 +379,8 @@ class MujocoRobot(MujocoObject):
         verbose: bool = True,
         load_ground_plane: bool = True,
         ft_sensor_links: List[str] = None,
+        smooth_ft: bool = False,
+        ft_smoothing_window: int = 10,
         render: bool = False,
     ):
         """Create a robot interface. Does not start the visualiser by default.
@@ -397,7 +413,10 @@ class MujocoRobot(MujocoObject):
                 path. Defaults to True.
             ft_sensor_links (List[str], optional): Bodies to instrument with force-torque sensors
                 (compile-time; only applied when loading from a path). Read with
-                ``get_link_ft_measurement``.
+                ``get_link_ft_measurement`` / ``get_ft_reading``.
+            smooth_ft (bool, optional): Average each force-torque sensor over a moving window
+                (filled by a post-step callable). Defaults to False.
+            ft_smoothing_window (int, optional): Window length used when ``smooth_ft`` is set.
             render (bool, optional): Launch a passive viewer on construction (needs a display).
                 Defaults to False.
         """
@@ -419,6 +438,9 @@ class MujocoRobot(MujocoObject):
         self._viewer = None
         self._async_thread: Optional[threading.Thread] = None
         self._running: bool = False
+        # Extensibility hooks run around each step: {name: (callable, args)}.
+        self._pre_step_callables: Dict[str, Tuple] = {}
+        self._post_step_callables: Dict[str, Tuple] = {}
         # Control state (consumed by the control methods and the per-step control hook).
         self._enable_torque_mode: bool = enable_torque_mode
         self._in_torque_mode: bool = False
@@ -447,6 +469,16 @@ class MujocoRobot(MujocoObject):
             name for name in (ft_sensor_links or []) if f"{name}_force" in self.sensor_name_to_id
         ]
         self._ft_enabled_links: set = set(self.ft_sensor_links)
+
+        # Optional force-torque smoothing: a moving-window buffer per instrumented link, filled by
+        # a post-step callable. get_ft_reading returns the window mean when enabled.
+        self._ft_smoothing_window: int = ft_smoothing_window
+        self._ft_buffers: Dict[str, deque] = {}
+        if smooth_ft and self.ft_sensor_links:
+            self._ft_buffers = {
+                link: deque(maxlen=ft_smoothing_window) for link in self.ft_sensor_links
+            }
+            self.add_post_step_callable({"_ft_smoothing": [self._record_ft, []]})
 
         if default_joint_positions is not None:
             self.default_joint_positions = np.asarray(default_joint_positions, dtype=float)
@@ -477,13 +509,53 @@ class MujocoRobot(MujocoObject):
     # --- simulation lifecycle ----------------------------------------------
 
     def step(self):
-        """Advance the simulation by one timestep (only in synchronous mode)."""
+        """Advance the simulation by one timestep (only in synchronous mode).
+
+        Runs the registered pre-step callables, applies control, steps, then runs the post-step
+        callables and syncs the viewer.
+        """
         if self.sync_mode:
-            with self._lock:
-                self._apply_managed_control()
-                mujoco.mj_step(self.model, self.data)
-                if self._viewer is not None:
-                    self._viewer.sync()
+            self._locked_step()
+
+    def _locked_step(self):
+        """One step with hooks + control, holding the lock so it is safe against the async thread."""
+        with self._lock:
+            self._run_callables(self._pre_step_callables)
+            self._apply_managed_control()
+            mujoco.mj_step(self.model, self.data)
+            self._run_callables(self._post_step_callables)
+            if self._viewer is not None:
+                self._viewer.sync()
+
+    def add_pre_step_callable(self, f_dict: dict):
+        """Register callables to run before each ``mj_step``.
+
+        Args:
+            f_dict (dict): ``{name: [callable, [args]]}``. A name already registered is skipped
+                (existing entry kept), so callables are de-duplicated by name.
+        """
+        self._register_callables(self._pre_step_callables, f_dict)
+
+    def add_post_step_callable(self, f_dict: dict):
+        """Register callables to run after each ``mj_step``.
+
+        Args:
+            f_dict (dict): ``{name: [callable, [args]]}``. A name already registered is skipped
+                (existing entry kept), so callables are de-duplicated by name.
+        """
+        self._register_callables(self._post_step_callables, f_dict)
+
+    @staticmethod
+    def _register_callables(store: dict, f_dict: dict):
+        for name, spec in f_dict.items():
+            if name in store:
+                continue  # dedup by name: keep the existing callable
+            store[name] = (spec[0], spec[1] if len(spec) > 1 else [])
+
+    @staticmethod
+    def _run_callables(store: dict):
+        for fn, args in store.values():
+            fn(*args)
 
     def _start_async(self):
         if self._running:
@@ -496,11 +568,7 @@ class MujocoRobot(MujocoObject):
         while self._running:
             dt = float(self.model.opt.timestep)
             start = time.perf_counter()
-            with self._lock:
-                self._apply_managed_control()
-                mujoco.mj_step(self.model, self.data)
-                if self._viewer is not None:
-                    self._viewer.sync()
+            self._locked_step()
             time.sleep(max(0.0, dt - (time.perf_counter() - start)))
 
     def _stop_async(self):
@@ -944,6 +1012,17 @@ class MujocoRobot(MujocoObject):
             actuated_joint_names = self.actuated_joint_names
         return self.get_joint_states(self.get_joint_ids(actuated_joint_names))[2]
 
+    def get_actuated_joint_accelerations(
+        self, actuated_joint_names: List[str] = None
+    ) -> np.ndarray:
+        """Get current accelerations (``data.qacc``) of the actuated joints, in default order."""
+        if actuated_joint_names is None:
+            actuated_joint_names = self.actuated_joint_names
+        with self._lock:
+            return np.array(
+                [self.data.qacc[self.joint_name_to_info[n].dof_adr] for n in actuated_joint_names]
+            )
+
     # --- base state ---------------------------------------------------------
 
     def _object_velocity(self, body_id: int) -> Tuple[Vector3D, Vector3D]:
@@ -1041,23 +1120,31 @@ class MujocoRobot(MujocoObject):
 
     # --- dynamics -----------------------------------------------------------
 
-    def get_gravity_compensation_torques(self) -> np.ndarray:
-        """Joint torques that hold the robot static against gravity at the current configuration.
+    def get_gravity_compensation_torques(self, include_coriolis: bool = False) -> np.ndarray:
+        """Joint torques that counteract passive dynamics, per actuated joint (default order).
 
-        Computed as the bias force (``qfrc_bias``) evaluated at zero velocity and acceleration on
-        a scratch copy, i.e. the pure gravity term, per actuated joint (``actuated_joint_names``
-        order). Useful as a feedforward term for torque / impedance control.
+        The bias force ``qfrc_bias`` includes gravity plus Coriolis / centrifugal terms at the
+        current velocity. This method exposes the choice:
+
+        - ``include_coriolis=True``: returns ``data.qfrc_bias`` at the current velocity directly.
+        - ``include_coriolis=False`` (default, "hold against gravity"): the pure gravity term,
+          computed via inverse dynamics on a scratch copy at zero velocity and acceleration
+          (``mj_inverse`` -> ``qfrc_inverse``). The live simulation state is not mutated.
 
         Returns:
-            np.ndarray: Gravity-compensation torque per actuated joint.
+            np.ndarray: Torque per actuated joint (a useful feedforward term for torque/impedance
+                control).
         """
         with self._lock:
-            scratch = self._get_scratch_data()
-            scratch.qpos[:] = self.data.qpos
-            scratch.qvel[:] = 0.0
-            scratch.qacc[:] = 0.0
-            mujoco.mj_forward(self.model, scratch)
-            bias = np.array(scratch.qfrc_bias)
+            if include_coriolis:
+                bias = np.array(self.data.qfrc_bias)
+            else:
+                scratch = self._get_scratch_data()
+                scratch.qpos[:] = self.data.qpos
+                scratch.qvel[:] = 0.0
+                scratch.qacc[:] = 0.0
+                mujoco.mj_inverse(self.model, scratch)
+                bias = np.array(scratch.qfrc_inverse)
         return np.array(
             [bias[self.joint_name_to_info[n].dof_adr] for n in self.actuated_joint_names]
         )
@@ -1153,6 +1240,31 @@ class MujocoRobot(MujocoObject):
                 net += fw if lid == b2 else -fw
         return net
 
+    def get_contact_info(self) -> List[ContactInfo]:
+        """Detailed info for every active contact: position, contact frame, and wrench.
+
+        Calls ``mj_rnePostConstraint`` first so the contact forces are available. This is the
+        detailed variant; :meth:`get_ee_contact_states` remains the lightweight boolean check.
+
+        Returns:
+            List[ContactInfo]: one entry per active contact (empty if none).
+        """
+        wrench = np.zeros(6)
+        contacts: List[ContactInfo] = []
+        with self._lock:
+            mujoco.mj_rnePostConstraint(self.model, self.data)
+            for i in range(self.data.ncon):
+                contact = self.data.contact[i]
+                mujoco.mj_contactForce(self.model, self.data, i, wrench)
+                contacts.append(
+                    ContactInfo(
+                        pos=np.array(contact.pos),
+                        frame=np.array(contact.frame).reshape(3, 3),
+                        wrench=wrench.copy(),
+                    )
+                )
+        return contacts
+
     # --- force-torque sensors -----------------------------------------------
 
     def has_ft_sensor(self, link_name: str) -> bool:
@@ -1177,6 +1289,61 @@ class MujocoRobot(MujocoObject):
             force = self._read_sensor(f"{link_name}_force")
             torque = self._read_sensor(f"{link_name}_torque")
         return np.concatenate([force, torque])
+
+    def _read_ft_raw(self, link_name: str) -> np.ndarray:
+        """Raw 6D sensor reading (force then torque, sensor frame), no sign flip or gating."""
+        return np.concatenate(
+            [self._read_sensor(f"{link_name}_force"), self._read_sensor(f"{link_name}_torque")]
+        )
+
+    def _record_ft(self):
+        """Post-step callable: append each instrumented link's raw reading to its smoothing buffer."""
+        for link, buffer in self._ft_buffers.items():
+            buffer.append(self._read_ft_raw(link))
+
+    def get_ft_reading(
+        self, in_global_frame: bool = True, sensor_name: str = None
+    ) -> Tuple[Vector3D, Vector3D]:
+        """Force-torque reading as ``(force[3], torque[3])``, expressed on the parent body.
+
+        The sensor is resolved by name (``sensor_name`` is the instrumented link; defaults to the
+        first in ``ft_sensor_links``) rather than by index. The raw sensor value is negated so the
+        result is the wrench acting *on* the parent body. If smoothing is enabled the moving-window
+        mean is used.
+
+        Args:
+            in_global_frame (bool, optional): Rotate the wrench into the world frame using the
+                sensor site's orientation. If the site is unavailable, warns and returns the
+                sensor-frame values. Defaults to True.
+            sensor_name (str, optional): Instrumented link name. Defaults to the first instrumented
+                link.
+
+        Returns:
+            Tuple[Vector3D, Vector3D]: (force, torque).
+        """
+        link = sensor_name if sensor_name is not None else (
+            self.ft_sensor_links[0] if self.ft_sensor_links else None
+        )
+        if link is None or not self.has_ft_sensor(link):
+            raise ValueError(
+                "No force-torque sensor available; construct with ft_sensor_links=[...]."
+            )
+        with self._lock:
+            buffer = self._ft_buffers.get(link)
+            raw = np.mean(np.stack(buffer), axis=0) if buffer else self._read_ft_raw(link)
+            # Negate to express the wrench on the parent body.
+            force, torque = -raw[:3], -raw[3:]
+            if in_global_frame:
+                site_id = self.site_name_to_id.get(f"{link}_ft_site")
+                if site_id is None:
+                    warnings.warn(
+                        f"No site '{link}_ft_site'; returning sensor-frame force-torque.",
+                        stacklevel=2,
+                    )
+                else:
+                    rot = np.array(self.data.site_xmat[site_id]).reshape(3, 3)
+                    force, torque = rot @ force, rot @ torque
+        return force, torque
 
     def get_joint_ft_measurements(self, joint_ids: List[int] = None) -> np.ndarray:
         """Force-torque wrench transmitted at each joint (measured at the joint's child link).

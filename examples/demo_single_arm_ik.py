@@ -14,7 +14,7 @@ import time
 
 import numpy as np
 
-from mujoco_robot import MujocoRobot
+from mujoco_robot import MujocoRobot, viewer_utils
 from mujoco_robot.ik import differential_ik
 from mujoco_robot.utils.robot_loader_utils import get_mjcf_from_awesome_robot_descriptions
 
@@ -62,6 +62,10 @@ def main(render: bool = True, duration: float = None):
             # UR5e has no gripper, so every actuated joint is an arm joint.
             q = differential_ik(robot.model, robot.data, EE_SITE, target, target_quat=fixed_ori)
             robot.set_joint_positions(q)
+            if render:
+                # show the target frame the arm is chasing
+                viewer_utils.clear_user_geoms(robot.viewer)
+                viewer_utils.render_frame(robot.viewer, target, fixed_ori, scale=0.1)
             robot.step()
 
             now = time.time()

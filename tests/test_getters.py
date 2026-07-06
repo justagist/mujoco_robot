@@ -4,6 +4,7 @@ Includes empirical checks for the two error-prone conventions: the [x,y,z,w] qua
 and the (linear, angular) ordering of velocities.
 """
 
+import mujoco
 import numpy as np
 
 from mujoco_robot import MujocoRobot
@@ -19,6 +20,36 @@ def make(**kw) -> MujocoRobot:
     kw.setdefault("load_ground_plane", False)
     kw.setdefault("ee_names", ["hand"])
     return MujocoRobot(mjcf_path=PANDA, **kw)
+
+
+def test_joint_accelerations_shape():
+    r = make()
+    try:
+        r.step()
+        assert r.get_actuated_joint_accelerations().shape == (9,)
+    finally:
+        r.shutdown()
+
+
+def test_gravity_compensation_modes():
+    # A within-limits config, so no joint-limit constraint force is active (which mj_inverse would
+    # otherwise legitimately include, making the two modes disagree even at rest).
+    r = make(default_joint_positions=[0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785, 0.02, 0.02])
+    try:
+        pure = r.get_gravity_compensation_torques()
+        assert pure.shape == (9,) and np.all(np.isfinite(pure))
+        # at rest the Coriolis terms vanish, so both modes agree
+        assert np.allclose(
+            pure, r.get_gravity_compensation_torques(include_coriolis=True), atol=1e-6
+        )
+        # with motion they differ (Coriolis / centrifugal present)
+        r.data.qvel[:] = 0.8
+        mujoco.mj_forward(r.model, r.data)
+        moving = r.get_gravity_compensation_torques(include_coriolis=True)
+        pure_gravity = r.get_gravity_compensation_torques()  # scratch at qvel=0
+        assert not np.allclose(moving, pure_gravity)
+    finally:
+        r.shutdown()
 
 
 def test_joint_states_shapes_and_values():

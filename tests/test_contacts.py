@@ -2,8 +2,10 @@
 
 import mujoco
 import numpy as np
+import pytest
 
 from mujoco_robot import MujocoRobot
+from mujoco_robot.mujoco_robot import ContactInfo
 from mujoco_robot.utils.robot_loader_utils import get_mjcf_from_awesome_robot_descriptions
 
 PANDA = get_mjcf_from_awesome_robot_descriptions("panda_mj_description")
@@ -29,6 +31,64 @@ def panda(**kw) -> MujocoRobot:
     kw.setdefault("place_on_ground", False)
     kw.setdefault("default_joint_positions", NEUTRAL)
     return MujocoRobot(mjcf_path=PANDA, **kw)
+
+
+def test_ft_reading_sign_and_frames():
+    r = panda(ft_sensor_links=["hand"])
+    try:
+        for _ in range(50):
+            r.step()
+        raw = r.get_link_ft_measurement("hand")  # sensor frame, no sign flip
+        force, torque = r.get_ft_reading(in_global_frame=False)
+        assert np.allclose(force, -raw[:3])  # negated to be the force on the parent body
+        assert np.allclose(torque, -raw[3:])
+        fg, tg = r.get_ft_reading(in_global_frame=True)
+        assert fg.shape == (3,) and tg.shape == (3,)
+    finally:
+        r.shutdown()
+
+
+def test_ft_reading_requires_a_sensor():
+    r = panda()  # no ft_sensor_links
+    try:
+        with pytest.raises(ValueError):
+            r.get_ft_reading()
+    finally:
+        r.shutdown()
+
+
+def test_ft_smoothing_fills_buffer():
+    r = panda(ft_sensor_links=["hand"], smooth_ft=True, ft_smoothing_window=5)
+    try:
+        for _ in range(10):
+            r.step()
+        assert len(r._ft_buffers["hand"]) == 5
+        force, torque = r.get_ft_reading()
+        assert np.all(np.isfinite(force)) and np.all(np.isfinite(torque))
+    finally:
+        r.shutdown()
+
+
+def test_contact_info_on_resting_box():
+    box = MujocoRobot(
+        model=mujoco.MjModel.from_xml_string(BOX_XML),
+        run_async=False,
+        verbose=False,
+        place_on_ground=False,
+        default_base_position=[0.0, 0.0, 0.3],
+    )
+    try:
+        for _ in range(700):
+            box.step()
+        contacts = box.get_contact_info()
+        assert len(contacts) > 0
+        contact = contacts[0]
+        assert isinstance(contact, ContactInfo)
+        assert contact.pos.shape == (3,)
+        assert contact.frame.shape == (3, 3)
+        assert contact.wrench.shape == (6,)
+    finally:
+        box.shutdown()
 
 
 def test_contact_states_and_force_on_resting_box():

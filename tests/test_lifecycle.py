@@ -23,6 +23,32 @@ def make(**kw) -> MujocoRobot:
     return MujocoRobot(mjcf_path=PANDA, **kw)
 
 
+def test_pre_and_post_step_callables_run_in_order():
+    r = make()
+    try:
+        order = []
+        r.add_pre_step_callable({"pre": [lambda: order.append("pre"), []]})
+        r.add_post_step_callable({"post": [lambda: order.append("post"), []]})
+        r.step()
+        assert order == ["pre", "post"]  # pre before mj_step, post after
+    finally:
+        r.shutdown()
+
+
+def test_step_callable_dedup_and_args():
+    r = make()
+    try:
+        hits, seen = [], []
+        r.add_pre_step_callable({"f": [lambda: hits.append("first"), []]})
+        r.add_pre_step_callable({"f": [lambda: hits.append("second"), []]})  # same name -> ignored
+        r.add_post_step_callable({"a": [lambda x: seen.append(x), [42]]})
+        r.step()
+        assert hits == ["first"]  # de-duplicated by name
+        assert seen == [42]  # args are forwarded
+    finally:
+        r.shutdown()
+
+
 def test_load_fixed_base():
     r = make()
     try:
