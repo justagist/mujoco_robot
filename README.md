@@ -1,40 +1,29 @@
 # MuJoCo Robot
 
-> 🚧 **Work in progress** (pre-release).
+[![CI](https://github.com/justagist/mujoco_robot/actions/workflows/ci.yml/badge.svg)](https://github.com/justagist/mujoco_robot/actions/workflows/ci.yml)
+[![PyPI version](https://img.shields.io/pypi/v/mujoco-robot)](https://pypi.org/project/mujoco-robot/)
+[![Python versions](https://img.shields.io/pypi/pyversions/mujoco-robot)](https://pypi.org/project/mujoco-robot/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-A general Python interface for robot simulations using [MuJoCo](https://mujoco.org). Its public
-API mirrors [`pybullet_robot`](https://github.com/justagist/pybullet_robot) so that controllers
-written against that backend can be run here with minimal changes.
-
-`MujocoRobot` gives you a single object to load, introspect, control, and read state from a robot,
-implemented directly on `MjModel` + `MjData`.
-
-## Features
-
-- **Load** a robot from an MJCF/URDF file, or wrap an existing `(model, data)` pair. A minimal
-  world (ground plane, light) and force-torque sensors can be assembled with the `MjSpec` helpers
-  in `mujoco_robot.utils.model_builder`.
-- **Introspect**: name↔id maps for bodies, joints, actuators, sites, geoms, and sensors, with
-  per-joint `qpos`/`dof` addressing.
-- **Lifecycle**: manual `step()` or a background stepping thread, an optional passive viewer,
-  timestep/gravity access, joint/base resets, and place-on-ground.
-- **State**: joint positions/velocities/efforts, base and link/site pose and velocity (quaternions
-  as `[x, y, z, w]`), the geometric Jacobian, gravity-compensation torques, and a `get_robot_states`
-  snapshot.
-- **Control**: position control through the model's actuators (`data.ctrl`), and torque/impedance
-  control through `data.qfrc_applied`, with a PVT-PD command and position/torque mode switching.
-- **Contacts and force-torque**: per-link contact state and net contact force, plus compile-time
-  force-torque sensors.
-- **Cosmetics / domain randomisation**: visual transparency, per-geom collision toggling, and
-  live-safe dynamics randomisation.
+A general Python interface for robot simulations using [MuJoCo](https://mujoco.org). Its public API
+mirrors [`pybullet_robot`](https://github.com/justagist/pybullet_robot) so that controllers written
+against that backend can be run here with minimal changes. `MujocoRobot` is a single object to
+load, introspect, control, and read state from a robot, implemented directly on `MjModel` +
+`MjData`.
 
 ## Installation
 
 > Requires Python >= 3.10 and `mujoco >= 3.2`.
 
 ```bash
-git clone https://github.com/justagist/mujoco_robot
-cd mujoco_robot
+pip install mujoco_robot
+pip install "mujoco_robot[ik]"   # optional whole-body IK backend (mink)
+```
+
+From source:
+
+```bash
+git clone https://github.com/justagist/mujoco_robot && cd mujoco_robot
 pip install -e .
 ```
 
@@ -60,29 +49,68 @@ while robot.is_viewer_running():
     robot.step()
 ```
 
+## Features
+
+- **Load** an MJCF/URDF file, or wrap an existing `(model, data)`; assemble a world (ground, light,
+  props, force-torque sensors) with the `MjSpec` helpers in `mujoco_robot.utils.model_builder`.
+- **Introspect**: name<->id maps for bodies, joints, actuators, sites, geoms, and sensors, with
+  per-joint `qpos`/`dof` addressing.
+- **Lifecycle**: manual `step()` or a background stepping thread, an optional passive viewer,
+  joint/base resets, and place-on-ground.
+- **State**: joint, base, and link/site pose and velocity (quaternions as `[x, y, z, w]`), the
+  geometric Jacobian, gravity-compensation torques, and a `get_robot_states` snapshot.
+- **Control**: position control via the model's actuators, and torque/impedance control via
+  `data.qfrc_applied`, with a PVT-PD command and position/torque mode switching.
+- **Contacts and force-torque** sensing, plus **cosmetics / domain-randomisation** helpers
+  (transparency, per-geom collision, dynamics editing).
+- **Inverse kinematics**: `differential_ik` for a single frame (`from mujoco_robot.ik import
+  differential_ik`); [`mink`](https://github.com/kevinzakka/mink) for whole-body (optional `[ik]`).
+
 ## Examples
 
-Runnable demos live in `examples/` (each takes `--headless` to run without the viewer):
+Runnable demos in `examples/` (each takes `--headless` to run without the viewer):
 
-- `demo_joint_position_control.py`: the arm follows a joint-space sinusoid under position control.
-- `demo_task_space_control.py`: Cartesian impedance control traces a circle with the end-effector.
-- `demo_ft_sensor.py`: the hand presses onto a block and the measured force-torque wrench is shown.
-- `demo_reference_ghost.py`: a translucent, collision-free robot posed kinematically as a reference.
+### Joint Position Control
+
+KUKA iiwa14 follows a joint-space sinusoid (position control).
+
+![Joint-space position control demo](https://media.githubusercontent.com/media/justagist/_assets/refs/heads/main/mujoco_robot/mujoco_robot_jctrl.gif)
+
+### Task Space Control
+
+Panda traces a circle with Cartesian impedance control.
+
+![Task-space control demo](https://media.githubusercontent.com/media/justagist/_assets/refs/heads/main/mujoco_robot/mujoco_robot_tsctrl.gif)
+
+### Measuring Contact Forces using FT Sensor
+
+Contact wrench visualised as the robot presses on a block.
+
+![FT sensor demo](https://media.githubusercontent.com/media/justagist/_assets/refs/heads/main/mujoco_robot/mujoco_robot_ft_demo.gif)
+
+### Single arm Inverse Kinematics
+
+UR5e tracks a moving target with `differential_ik`.
+
+![IK demo](https://media.githubusercontent.com/media/justagist/_assets/refs/heads/main/mujoco_robot/mujoco_robot_ik.gif)
+
+### Whole body IK (via `mink` -- needs `pip install "mujoco_robot[ik]"`)
+
+Go1 whole-body squat demo by doing IK for all four feet and body simultaneously.
+
+![WB IK demo](https://media.githubusercontent.com/media/justagist/_assets/refs/heads/main/mujoco_robot/mujoco_robot_wb_ik.gif)
 
 ## Design notes
 
 - **Quaternions:** the external API uses `[x, y, z, w]` (scipy convention); values are converted to
   MuJoCo's `[w, x, y, z]` only at the boundary.
-- **Angles:** joint positions, velocities, and limits are in radians. A compiled model always
-  stores radians regardless of the MJCF `compiler angle` setting, so no conversion is done.
-- **Backend:** pure `MjModel` + `MjData` (no client-server). Pass an existing `(model, data)` to
-  wrap a robot that is already part of a scene.
-- **End-effector frame:** a body by default; a site can be used optionally.
+- **Angles:** joint positions, velocities, and limits are in radians (a compiled model always
+  stores radians, regardless of the MJCF `compiler angle` setting).
 - **Control:** writes `data.ctrl` when the model has actuators, otherwise falls back to
   `data.qfrc_applied` with a Python PD loop.
 - **Fixed vs floating base:** a structural free joint (added via `MjSpec`), not a load-time flag.
-- **Sensors:** MuJoCo sensors are compile-time, so force-torque sensors are declared up front
-  (`ft_sensor_links`) and the toggle only gates reading, rather than adding/removing at runtime.
+- **Sensors:** force-torque sensors are declared up front (`ft_sensor_links`); the toggle only
+  gates reading, since MuJoCo sensors are compile-time.
 
 ## Development
 
