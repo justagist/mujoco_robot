@@ -197,6 +197,12 @@ class MujocoObject:
         }
         self.link_id_to_name: Dict[int, str] = dict(zip(self.link_ids, self.link_names))
 
+        # Geoms belonging to the robot's links (for transparency / collision toggling).
+        link_id_set = set(self.link_ids)
+        self.robot_geom_ids: List[int] = [
+            g for g in range(model.ngeom) if int(model.geom_bodyid[g]) in link_id_set
+        ]
+
         # Base = root body (first body whose parent is the world).
         self.base_id: int = next(
             (i for i in range(1, model.nbody) if int(model.body_parentid[i]) == 0), 1
@@ -358,7 +364,6 @@ class MujocoRobot(MujocoObject):
         enable_torque_mode: bool = False,
         verbose: bool = True,
         load_ground_plane: bool = True,
-        ghost_mode: bool = False,
         ft_sensor_links: List[str] = None,
         render: bool = False,
     ):
@@ -390,8 +395,6 @@ class MujocoRobot(MujocoObject):
             verbose (bool, optional): Print a robot info summary on construction. Defaults to True.
             load_ground_plane (bool, optional): Add a ground plane + light when loading from a
                 path. Defaults to True.
-            ghost_mode (bool, optional): Make the robot collision-free and translucent. Defaults
-                to False.
             ft_sensor_links (List[str], optional): Bodies to instrument with force-torque sensors
                 (compile-time; only applied when loading from a path). Read with
                 ``get_link_ft_measurement``.
@@ -418,9 +421,10 @@ class MujocoRobot(MujocoObject):
         self._running: bool = False
         # Control state (consumed by the control methods and the per-step control hook).
         self._enable_torque_mode: bool = enable_torque_mode
-        self._ghost_mode: bool = ghost_mode
         self._in_torque_mode: bool = False
         self._managed_targets: Dict[int, Tuple[Optional[float], float]] = {}
+        # Cosmetics: geoms whose collision masks were saved when disabled (for restore).
+        self._saved_geom_masks: Dict[int, Tuple[int, int]] = {}
         self.default_position_kp: float = 100.0
         self.default_position_kd: float = 10.0
 
@@ -1217,6 +1221,196 @@ class MujocoRobot(MujocoObject):
             joint_ids = [joint_ids]
         links = [self.body_id_to_name[int(self.model.jnt_bodyid[j])] for j in joint_ids]
         self.toggle_ft_sensor_for_links(links, enable)
+
+    # --- cosmetics / dynamics -----------------------------------------------
+
+    def set_robot_transparency(self, alpha: float):
+        """Set the visual transparency of the robot's geoms.
+
+        Mutates ``model.geom_rgba[:, 3]`` for the robot's geoms; the change is picked up live by
+        the viewer on the next sync. Note that geoms that draw from a material/texture may ignore
+        ``geom_rgba``, so transparency is most reliable on primitive/rgba geoms.
+
+        Args:
+            alpha (float): Opacity from 0 (invisible) to 1 (opaque).
+        """
+        with self._lock:
+            for g in self.robot_geom_ids:
+                self.model.geom_rgba[g, 3] = alpha
+
+    def set_geom_collision(self, geom, enabled: bool):
+        """Enable or disable collisions for a single geom.
+
+        Disabling zeroes the geom's ``contype``/``conaffinity`` (saving the originals); enabling
+        restores the saved masks. Useful for making a reference/preview robot pass through the
+        world without interacting.
+
+        Args:
+            geom (int | str): Geom id or name.
+            enabled (bool): True to collide, False to disable collisions.
+        """
+        gid = geom if isinstance(geom, (int, np.integer)) else self.geom_name_to_id[geom]
+        gid = int(gid)
+        with self._lock:
+            if enabled:
+                if gid in self._saved_geom_masks:
+                    contype, conaffinity = self._saved_geom_masks.pop(gid)
+                    self.model.geom_contype[gid] = contype
+                    self.model.geom_conaffinity[gid] = conaffinity
+            else:
+                if gid not in self._saved_geom_masks:
+                    self._saved_geom_masks[gid] = (
+                        int(self.model.geom_contype[gid]),
+                        int(self.model.geom_conaffinity[gid]),
+                    )
+                self.model.geom_contype[gid] = 0
+                self.model.geom_conaffinity[gid] = 0
+
+    # --- dynamics editing (domain randomisation) ----------------------------
+    #
+    # These edit the compiled model directly, addressed by MuJoCo object type and MuJoCo field
+    # names. They are restricted to the robot's own elements and are safe to call between steps.
+
+    def _robot_geom_id(self, geom_name: str) -> int:
+        gid = self.geom_name_to_id.get(geom_name)
+        if gid is None or gid not in self.robot_geom_ids:
+            raise ValueError(f"'{geom_name}' is not a geom belonging to this robot.")
+        return gid
+
+    def _robot_body_id(self, body_name: str) -> int:
+        bid = self.body_name_to_id.get(body_name)
+        if bid is None or bid not in self.link_ids:
+            raise ValueError(f"'{body_name}' is not a body belonging to this robot.")
+        return bid
+
+    def _robot_joint_info(self, joint_name: str) -> MujocoJointInfo:
+        info = self.joint_name_to_info.get(joint_name)
+        if info is None or info.body_id not in self.link_ids:
+            raise ValueError(f"'{joint_name}' is not a joint belonging to this robot.")
+        return info
+
+    def _write_geom_friction(self, geom_name, friction):
+        gid = self._robot_geom_id(geom_name)
+        friction = np.asarray(friction, dtype=float)
+        if friction.ndim == 0:
+            self.model.geom_friction[gid, 0] = float(friction)  # scalar -> sliding friction
+        else:
+            self.model.geom_friction[gid] = friction  # [sliding, torsional, rolling]
+
+    def _write_dof_field(self, field: str, joint_name: str, value):
+        info = self._robot_joint_info(joint_name)
+        if info.dof_dim > 1 and np.ndim(value) == 0:
+            raise ValueError(
+                f"Joint '{joint_name}' has {info.dof_dim} dofs; pass a per-dof array for {field}."
+            )
+        getattr(self.model, field)[info.dof_adr : info.dof_adr + info.dof_dim] = value
+
+    def _write_body_mass(self, body_name, mass, scale_inertia: bool = True):
+        bid = self._robot_body_id(body_name)
+        old = float(self.model.body_mass[bid])
+        self.model.body_mass[bid] = mass
+        if scale_inertia and old > 0.0:
+            self.model.body_inertia[bid] = self.model.body_inertia[bid] * (float(mass) / old)
+        # Keep subtree masses consistent: the delta propagates to this body and every ancestor.
+        delta = float(mass) - old
+        b = bid
+        while True:
+            self.model.body_subtreemass[b] += delta
+            if b == 0:
+                break
+            b = int(self.model.body_parentid[b])
+
+    def set_geom_friction(self, geom_name: str, friction):
+        """Set a robot geom's friction. Scalar sets sliding friction; a 3-vector sets all three."""
+        with self._lock:
+            self._write_geom_friction(geom_name, friction)
+            mujoco.mj_forward(self.model, self.data)
+
+    def set_geom_solref(self, geom_name: str, solref):
+        """Set a robot geom's contact solver reference ``[timeconst, dampratio]`` (contact softness)."""
+        gid = self._robot_geom_id(geom_name)
+        with self._lock:
+            self.model.geom_solref[gid] = solref
+            mujoco.mj_forward(self.model, self.data)
+
+    def set_geom_solimp(self, geom_name: str, solimp):
+        """Set a robot geom's contact solver impedance (5-vector)."""
+        gid = self._robot_geom_id(geom_name)
+        with self._lock:
+            self.model.geom_solimp[gid] = solimp
+            mujoco.mj_forward(self.model, self.data)
+
+    def set_dof_damping(self, joint_name: str, value):
+        """Set the joint's dof damping (per-dof array required for multi-dof joints)."""
+        with self._lock:
+            self._write_dof_field("dof_damping", joint_name, value)
+            mujoco.mj_forward(self.model, self.data)
+
+    def set_dof_frictionloss(self, joint_name: str, value):
+        """Set the joint's dof friction loss (per-dof array required for multi-dof joints)."""
+        with self._lock:
+            self._write_dof_field("dof_frictionloss", joint_name, value)
+            mujoco.mj_forward(self.model, self.data)
+
+    def set_dof_armature(self, joint_name: str, value):
+        """Set the joint's dof armature (per-dof array required for multi-dof joints)."""
+        with self._lock:
+            self._write_dof_field("dof_armature", joint_name, value)
+            mujoco.mj_forward(self.model, self.data)
+
+    def set_body_mass(self, body_name: str, mass: float, *, scale_inertia: bool = True):
+        """Set a robot body's mass (cheap live path for small perturbations / randomisation).
+
+        Scales the body's inertia by the same ratio (unless ``scale_inertia=False``) and fixes the
+        subtree masses so the model stays consistent, then calls ``mj_forward``.
+
+        WARNING: large mass ratios can produce a near-singular inertia and NaN accelerations. For
+        large changes or whole-model rescaling, rebuild the model instead (edit an ``MjSpec`` and
+        recompile), or use :meth:`set_total_mass`.
+        """
+        with self._lock:
+            self._write_body_mass(body_name, mass, scale_inertia)
+            mujoco.mj_forward(self.model, self.data)
+
+    def set_total_mass(self, total: float):
+        """Rescale the whole model so its total mass equals ``total`` (via ``mj_setTotalmass``)."""
+        with self._lock:
+            mujoco.mj_setTotalmass(self.model, total)
+            mujoco.mj_forward(self.model, self.data)
+
+    def randomize_dynamics(
+        self,
+        *,
+        geom_friction: dict = None,
+        geom_solref: dict = None,
+        geom_solimp: dict = None,
+        dof_damping: dict = None,
+        dof_frictionloss: dict = None,
+        dof_armature: dict = None,
+        body_mass: dict = None,
+    ):
+        """Batch dynamics randomisation. Each argument is a ``{element_name: value}`` dict.
+
+        Dispatches over the per-field setters (geom fields keyed by geom name, dof fields by joint
+        name, ``body_mass`` by body name using the cheap live path), then does a single
+        ``mj_forward`` at the end rather than one per field.
+        """
+        with self._lock:
+            for name, value in (geom_friction or {}).items():
+                self._write_geom_friction(name, value)
+            for name, value in (geom_solref or {}).items():
+                self.model.geom_solref[self._robot_geom_id(name)] = value
+            for name, value in (geom_solimp or {}).items():
+                self.model.geom_solimp[self._robot_geom_id(name)] = value
+            for name, value in (dof_damping or {}).items():
+                self._write_dof_field("dof_damping", name, value)
+            for name, value in (dof_frictionloss or {}).items():
+                self._write_dof_field("dof_frictionloss", name, value)
+            for name, value in (dof_armature or {}).items():
+                self._write_dof_field("dof_armature", name, value)
+            for name, value in (body_mass or {}).items():
+                self._write_body_mass(name, value, scale_inertia=True)
+            mujoco.mj_forward(self.model, self.data)
 
     # --- info ---------------------------------------------------------------
 
