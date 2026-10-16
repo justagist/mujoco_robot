@@ -1,19 +1,11 @@
-"""MuJoCo robot interface. This is a stand-alone file.
+"""MuJoCo robot interface, implemented purely on ``mujoco.MjModel`` + ``MjData`` (no client-server).
 
-Implemented purely on ``mujoco.MjModel`` + ``MjData`` (no client-server).
-
-Quaternion convention: everything exposed by this module uses ``[x, y, z, w]`` (scipy convention).
-MuJoCo internally uses ``[w, x, y, z]``; conversion happens ONLY at the boundary via
-:func:`wxyz_to_xyzw` / :func:`xyzw_to_wxyz`.
-
-Angle convention: all joint quantities exposed here (positions, velocities, limits) are in
-radians. A compiled ``MjModel`` always stores angles in radians regardless of the MJCF
-``compiler angle`` setting (which only affects how the XML *source* is parsed), so no runtime
-conversion is needed or performed.
+Conventions (``[x, y, z, w]`` quaternions, radians) are documented in :mod:`mujoco_robot.types`.
+The types and :class:`MujocoObject` are re-exported here, so existing imports from
+``mujoco_robot.mujoco_robot`` keep working.
 """
 
-from typing import Dict, List, Mapping, Optional, Sequence, Tuple, TypeAlias
-from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
 from collections import deque
 import atexit
 import threading
@@ -23,453 +15,33 @@ import warnings
 import numpy as np
 import mujoco
 
+from .mujoco_object import MujocoObject
+from .types import (
+    ContactInfo,
+    Frame,
+    MujocoJointInfo,
+    MujocoRobotState,
+    QuatType,
+    Vector3D,
+    wrap_angle,
+    wxyz_to_xyzw,
+    xyzw_to_wxyz,
+)
 from .utils.model_builder import build_model
 
-QuatType: TypeAlias = np.ndarray
-"""Numpy array representing a quaternion in format [x,y,z,w] (scipy convention)."""
-Vector3D: TypeAlias = np.ndarray
-"""Numpy array representing a 3D cartesian vector in format [x,y,z]."""
-
-# qpos / dof widths per joint type. free=7/6, ball=4/3, slide=1/1, hinge=1/1.
-_QPOS_DIM: Dict[int, int] = {
-    int(mujoco.mjtJoint.mjJNT_FREE): 7,
-    int(mujoco.mjtJoint.mjJNT_BALL): 4,
-    int(mujoco.mjtJoint.mjJNT_SLIDE): 1,
-    int(mujoco.mjtJoint.mjJNT_HINGE): 1,
-}
-_DOF_DIM: Dict[int, int] = {
-    int(mujoco.mjtJoint.mjJNT_FREE): 6,
-    int(mujoco.mjtJoint.mjJNT_BALL): 3,
-    int(mujoco.mjtJoint.mjJNT_SLIDE): 1,
-    int(mujoco.mjtJoint.mjJNT_HINGE): 1,
-}
-
-
-def wrap_angle(angle: float | np.ndarray) -> float | np.ndarray:
-    """Wrap the provided angle(s) (radians) to be within -pi and pi.
-
-    Args:
-        angle (float | np.ndarray): Input angle (or array of angles) in radians.
-
-    Returns:
-        float | np.ndarray: Output after wrapping.
-    """
-    return (angle + np.pi) % (2 * np.pi) - np.pi
-
-
-def wxyz_to_xyzw(quat_wxyz: np.ndarray) -> QuatType:
-    """Convert a MuJoCo quaternion ``[w,x,y,z]`` to the external ``[x,y,z,w]`` convention.
-
-    This is the single conversion point when reading orientations out of MuJoCo.
-
-    Args:
-        quat_wxyz (np.ndarray): Quaternion in MuJoCo order ``[w, x, y, z]``.
-
-    Returns:
-        QuatType: Quaternion in ``[x, y, z, w]`` order.
-    """
-    q = np.asarray(quat_wxyz, dtype=float)
-    return np.array([q[1], q[2], q[3], q[0]])
-
-
-def xyzw_to_wxyz(quat_xyzw: QuatType) -> np.ndarray:
-    """Convert an external ``[x,y,z,w]`` quaternion to MuJoCo's ``[w,x,y,z]`` convention.
-
-    This is the single conversion point when writing orientations into MuJoCo.
-
-    Args:
-        quat_xyzw (QuatType): Quaternion in ``[x, y, z, w]`` order.
-
-    Returns:
-        np.ndarray: Quaternion in MuJoCo order ``[w, x, y, z]``.
-    """
-    q = np.asarray(quat_xyzw, dtype=float)
-    return np.array([q[3], q[0], q[1], q[2]])
-
-
-def _id_name_maps(model: mujoco.MjModel, obj_type: int, n: int):
-    """Build (names, name->id, id->name) for a MuJoCo element kind. Unnamed elements map to ''."""
-    names: List[str] = []
-    name_to_id: Dict[str, int] = {}
-    id_to_name: Dict[int, str] = {}
-    for i in range(n):
-        name = mujoco.mj_id2name(model, obj_type, i)
-        name = name if name is not None else ""
-        names.append(name)
-        id_to_name[i] = name
-        if name:
-            name_to_id[name] = i
-    return names, name_to_id, id_to_name
-
-
-@dataclass
-class MujocoJointInfo:
-    """Static information about a single joint (from ``MjModel``)."""
-
-    joint_id: int
-    joint_name: str
-    joint_type: int
-    """MuJoCo joint type (``mujoco.mjtJoint``): free / ball / slide / hinge."""
-    qpos_adr: int
-    """Start index of this joint in ``data.qpos``."""
-    qpos_dim: int
-    """Number of ``qpos`` entries (free=7, ball=4, slide/hinge=1)."""
-    dof_adr: int
-    """Start index of this joint in ``data.qvel`` / dof-indexed arrays."""
-    dof_dim: int
-    """Number of dof entries (free=6, ball=3, slide/hinge=1)."""
-    body_id: int
-    """Id of the body this joint moves."""
-    body_name: str
-    lower_limit: float
-    upper_limit: float
-    limited: bool
-    """Whether the joint has enforced range limits."""
-    axis: Vector3D
-    """Joint axis in the local frame."""
-    damping: float
-    """dof damping (nan for multi-dof joints)."""
-    actuator_id: Optional[int]
-    """Id of the JOINT-transmission actuator driving this joint, or None."""
-
-
-@dataclass
-class MujocoRobotState:
-    """A snapshot of common robot state (world frame; quaternions are [x,y,z,w]).
-
-    Returned by :meth:`MujocoRobot.get_robot_states`.
-    """
-
-    base_position: Vector3D
-    base_com_position: Vector3D
-    base_quaternion: QuatType
-    base_velocity_linear: Vector3D
-    base_velocity_angular: Vector3D
-    actuated_joint_positions: np.ndarray
-    actuated_joint_velocities: np.ndarray
-    actuated_joint_torques: np.ndarray
-    joint_order: List[str]
-    """Actuated-joint names, in the order the joint arrays are given."""
-    ee_order: List[str]
-    """End-effector names reported."""
-    ee_contact_states: np.ndarray
-    """Binary contact state (1 = in contact, 0 = not), aligned with ee_order."""
-
-
-@dataclass
-class ContactInfo:
-    """Detailed information about a single active contact (see ``get_contact_info``)."""
-
-    pos: Vector3D
-    """Contact point in the world frame."""
-    frame: np.ndarray
-    """3x3 contact frame; rows are the contact axes in world coordinates (row 0 = normal / x)."""
-    wrench: np.ndarray
-    """6D contact wrench [force(3), torque(3)] in the contact frame (from ``mj_contactForce``)."""
-
-
-class MujocoObject:
-    """Static information about a MuJoCo object: name<->id maps and joint/link/dof bookkeeping.
-
-    Built from an existing ``MjModel``. No physics is performed here; this only reads the model's
-    structure (equivalent role to reading a loaded body's joint/link tables).
-
-    By default the whole model is the object: every non-free joint is an actuated joint, every
-    body is a link, and the root is the first child of the world. Passing ``joint_names`` scopes
-    the object to one robot inside a larger world: only those joints are actuated, and the links
-    are the subtree under the root body. Everything else in the model is foreign.
-    """
-
-    def __init__(
-        self,
-        model: mujoco.MjModel,
-        joint_names: Optional[Sequence[str]] = None,
-        root_body: Optional[str] = None,
-    ):
-        """Read all addressing/structure information from a compiled model.
-
-        Args:
-            model (mujoco.MjModel): A compiled MuJoCo model.
-            joint_names (Sequence[str], optional): Scope the object to exactly these 1-dof (hinge
-                or slide) joints, in this order. Defaults to None (the whole model).
-            root_body (str, optional): Name of the robot's root body. Base pose and velocity are
-                read from it, and the base is floating iff it carries a free joint. Defaults to
-                the first child of the world, or, when ``joint_names`` is given, the deepest body
-                that is an ancestor of every scoped joint.
-        """
-        self.model = model
-        self.is_scoped: bool = joint_names is not None
-        """Whether this object covers only the given ``joint_names`` (not the whole model)."""
-
-        obj = mujoco.mjtObj
-        self.body_names, self.body_name_to_id, self.body_id_to_name = _id_name_maps(
-            model, obj.mjOBJ_BODY, model.nbody
-        )
-        self.joint_names, self.joint_name_to_id, self.joint_id_to_name = _id_name_maps(
-            model, obj.mjOBJ_JOINT, model.njnt
-        )
-        self.actuator_names, self.actuator_name_to_id, self.actuator_id_to_name = _id_name_maps(
-            model, obj.mjOBJ_ACTUATOR, model.nu
-        )
-        self.site_names, self.site_name_to_id, self.site_id_to_name = _id_name_maps(
-            model, obj.mjOBJ_SITE, model.nsite
-        )
-        self.geom_names, self.geom_name_to_id, self.geom_id_to_name = _id_name_maps(
-            model, obj.mjOBJ_GEOM, model.ngeom
-        )
-        self.sensor_names, self.sensor_name_to_id, self.sensor_id_to_name = _id_name_maps(
-            model, obj.mjOBJ_SENSOR, model.nsensor
-        )
-
-        scoped_joint_ids = self._resolve_scoped_joints(joint_names) if self.is_scoped else None
-
-        # Base = root body: the given one, else the common ancestor of the scoped joints, else
-        # the first body whose parent is the world.
-        if root_body is not None:
-            if root_body not in self.body_name_to_id or self.body_name_to_id[root_body] == 0:
-                raise ValueError(f"'{root_body}' is not a body that can be a robot root.")
-            self.base_id: int = self.body_name_to_id[root_body]
-        elif self.is_scoped:
-            self.base_id = self._infer_root_body(scoped_joint_ids)
-        else:
-            self.base_id = next(
-                (i for i in range(1, model.nbody) if int(model.body_parentid[i]) == 0), 1
-            )
-        self.base_name: str = self.body_id_to_name.get(self.base_id, "")
-        self.name: str = self.base_name
-        """Name of the robot (its base/root link name)."""
-
-        # Links are bodies, excluding the world body (id 0). Scoped: the subtree under the root.
-        if self.is_scoped:
-            self.link_ids: List[int] = self._subtree_body_ids(self.base_id)
-        else:
-            self.link_ids = list(range(1, model.nbody))
-        self.link_names: List[str] = [self.body_id_to_name[i] for i in self.link_ids]
-        self.link_name_to_id: Dict[str, int] = {
-            n: i for n, i in zip(self.link_names, self.link_ids) if n
-        }
-        self.link_id_to_name: Dict[int, str] = dict(zip(self.link_ids, self.link_names))
-
-        # Geoms belonging to the robot's links (for transparency / collision toggling).
-        link_id_set = set(self.link_ids)
-        self.robot_geom_ids: List[int] = [
-            g for g in range(model.ngeom) if int(model.geom_bodyid[g]) in link_id_set
-        ]
-
-        # Map each joint-transmission actuator to the joint it drives (matched by transmission
-        # target, so actuator names need not match joint names).
-        joint_trn = (int(mujoco.mjtTrn.mjTRN_JOINT), int(mujoco.mjtTrn.mjTRN_JOINTINPARENT))
-        self.joint_id_to_actuator_id: Dict[int, int] = {}
-        joint_actuators: Dict[int, List[int]] = {}
-        for a in range(model.nu):
-            if int(model.actuator_trntype[a]) in joint_trn:
-                jid = int(model.actuator_trnid[a, 0])
-                self.joint_id_to_actuator_id[jid] = a
-                joint_actuators.setdefault(jid, []).append(a)
-        if self.is_scoped:
-            self.robot_actuator_ids: List[int] = sorted(
-                a for j in scoped_joint_ids for a in joint_actuators.get(j, [])
-            )
-            """Ids of the actuators driving this robot's actuated joints."""
-            self.has_actuators: bool = len(self.robot_actuator_ids) > 0
-        else:
-            self.robot_actuator_ids = list(range(model.nu))
-            self.has_actuators = model.nu > 0
-
-        # Total mass. Per-body dynamics (mass/inertia/com) are cheap direct lookups on the
-        # model's ``body_*`` arrays, so there is no per-link info struct; see get_link_mass.
-        self.mass: float = float(sum(model.body_mass[i] for i in self.link_ids))
-        """Total mass of this object."""
-
-        self._build_joint_info(scoped_joint_ids)
-
-    def _resolve_scoped_joints(self, joint_names: Sequence[str]) -> List[int]:
-        """Validate the scoped joint names and return their ids, in the given order."""
-        one_dof = (int(mujoco.mjtJoint.mjJNT_HINGE), int(mujoco.mjtJoint.mjJNT_SLIDE))
-        joint_names = list(joint_names)
-        if not joint_names:
-            raise ValueError("joint_names must name at least one joint.")
-        if len(set(joint_names)) != len(joint_names):
-            raise ValueError(f"joint_names contains duplicates: {joint_names}")
-        ids = []
-        for name in joint_names:
-            if name not in self.joint_name_to_id:
-                raise ValueError(f"No joint named '{name}' in the model.")
-            jid = self.joint_name_to_id[name]
-            if int(self.model.jnt_type[jid]) not in one_dof:
-                raise ValueError(f"Joint '{name}' is not a hinge or slide joint.")
-            ids.append(jid)
-        return ids
-
-    def _ancestors(self, body_id: int) -> List[int]:
-        """The body and its ancestors, nearest first, ending at the world body (id 0)."""
-        chain = [body_id]
-        while chain[-1] != 0:
-            chain.append(int(self.model.body_parentid[chain[-1]]))
-        return chain
-
-    def _common_ancestor(self, body_ids: List[int]) -> int:
-        """Deepest body that is an ancestor of (or equal to) every body in ``body_ids``."""
-        common = self._ancestors(body_ids[0])
-        for b in body_ids[1:]:
-            ancestors = set(self._ancestors(b))
-            common = [c for c in common if c in ancestors]
-        return common[0]
-
-    def _infer_root_body(self, joint_ids: List[int]) -> int:
-        """Root of a scoped robot: the deepest body that the scoped joints all move relative to.
-
-        That is the common ancestor of the joints' parent bodies (the arm base for a serial
-        chain, the hand for a pair of fingers). If that is the world, fall back to the common
-        ancestor of the joint bodies themselves.
-        """
-        joint_bodies = [int(self.model.jnt_bodyid[j]) for j in joint_ids]
-        root = self._common_ancestor([int(self.model.body_parentid[b]) for b in joint_bodies])
-        if root == 0:
-            root = self._common_ancestor(joint_bodies)
-        if root == 0:
-            raise ValueError(
-                "The given joints share no common body other than the world; pass root_body."
-            )
-        return root
-
-    def _subtree_body_ids(self, root_id: int) -> List[int]:
-        """Ids of ``root_id`` and all of its descendants (MuJoCo orders parents before children)."""
-        subtree = {root_id}
-        for b in range(root_id + 1, self.model.nbody):
-            if int(self.model.body_parentid[b]) in subtree:
-                subtree.add(b)
-        return sorted(subtree)
-
-    def _build_joint_info(self, scoped_joint_ids: Optional[List[int]] = None):
-        model = self.model
-        free_type = int(mujoco.mjtJoint.mjJNT_FREE)
-        hinge_type = int(mujoco.mjtJoint.mjJNT_HINGE)
-
-        self.joint_name_to_info: Mapping[str, MujocoJointInfo] = {}
-        self.actuated_joint_names: List[str] = []
-        self.actuated_joint_ids: List[int] = []
-        self.actuated_joint_lower_limits: List[float] = []
-        self.actuated_joint_upper_limits: List[float] = []
-        self.actuated_joint_qpos_adrs: List[int] = []
-        self.actuated_joint_dof_adrs: List[int] = []
-        self.continuous_joint_names: List[str] = []
-        self.continuous_joint_ids: List[int] = []
-        self.free_joint_id: Optional[int] = None
-
-        for j in range(model.njnt):
-            jtype = int(model.jnt_type[j])
-            name = self.joint_id_to_name[j]
-            qadr = int(model.jnt_qposadr[j])
-            dadr = int(model.jnt_dofadr[j])
-            limited = bool(model.jnt_limited[j])
-            lower, upper = (float(x) for x in model.jnt_range[j])
-            dof_dim = _DOF_DIM[jtype]
-
-            self.joint_name_to_info[name] = MujocoJointInfo(
-                joint_id=j,
-                joint_name=name,
-                joint_type=jtype,
-                qpos_adr=qadr,
-                qpos_dim=_QPOS_DIM[jtype],
-                dof_adr=dadr,
-                dof_dim=dof_dim,
-                body_id=int(model.jnt_bodyid[j]),
-                body_name=self.body_id_to_name[int(model.jnt_bodyid[j])],
-                lower_limit=lower,
-                upper_limit=upper,
-                limited=limited,
-                axis=np.array(model.jnt_axis[j]),
-                damping=float(model.dof_damping[dadr]) if dof_dim == 1 else float("nan"),
-                actuator_id=self.joint_id_to_actuator_id.get(j),
-            )
-
-            # A free joint on the root body is the floating base. Free joints elsewhere belong to
-            # other bodies in the world. Neither is an actuated joint.
-            if jtype == free_type:
-                if int(model.jnt_bodyid[j]) == self.base_id:
-                    self.free_joint_id = j
-                continue
-
-        if scoped_joint_ids is None:
-            scoped_joint_ids = [
-                j for j in range(model.njnt) if int(model.jnt_type[j]) != free_type
-            ]
-        else:
-            subtree = set(self.link_ids)
-            outside = [
-                self.joint_id_to_name[j]
-                for j in scoped_joint_ids
-                if int(model.jnt_bodyid[j]) not in subtree
-            ]
-            if outside:
-                raise ValueError(f"Joints {outside} are not under root body '{self.base_name}'.")
-
-        for j in scoped_joint_ids:
-            info = self.joint_name_to_info[self.joint_id_to_name[j]]
-            self.actuated_joint_ids.append(j)
-            self.actuated_joint_names.append(info.joint_name)
-            self.actuated_joint_lower_limits.append(info.lower_limit)
-            self.actuated_joint_upper_limits.append(info.upper_limit)
-            self.actuated_joint_qpos_adrs.append(info.qpos_adr)
-            self.actuated_joint_dof_adrs.append(info.dof_adr)
-
-            # A revolute joint with no limits is a continuous joint.
-            if info.joint_type == hinge_type and not info.limited:
-                self.continuous_joint_names.append(info.joint_name)
-                self.continuous_joint_ids.append(j)
-
-        self.num_actuated_joints: int = len(self.actuated_joint_ids)
-        self.has_floating_base: bool = self.free_joint_id is not None
-        self.has_continuous_joints: bool = len(self.continuous_joint_ids) > 0
-
-    # --- convenience loaders ------------------------------------------------
-
-    @classmethod
-    def from_mjcf_path(cls, mjcf_path: str) -> "MujocoObject":
-        """Compile a model from an MJCF (or URDF) file and read its structure.
-
-        Args:
-            mjcf_path (str): Path to an MJCF/URDF file.
-
-        Returns:
-            MujocoObject: Structure information for the compiled model.
-        """
-        return cls(mujoco.MjModel.from_xml_path(mjcf_path))
-
-    # --- name <-> id accessors ---------------------------------------------
-
-    def get_joint_id(self, joint_name: str) -> int:
-        """Get the id of the specified joint."""
-        return self.joint_name_to_id[joint_name]
-
-    def get_joint_name(self, joint_id: int) -> str:
-        """Get the name of the joint with the given id."""
-        return self.joint_id_to_name[joint_id]
-
-    def get_joint_ids(self, joint_names: List[str]) -> List[int]:
-        """Get the ids of the specified joints, in the given order."""
-        return [self.joint_name_to_id[name] for name in joint_names]
-
-    def get_link_id(self, link_name: str) -> int:
-        """Get the body id of the specified link."""
-        return self.link_name_to_id[link_name]
-
-    def get_link_name(self, link_id: int) -> str:
-        """Get the name of the link (body) with the given id."""
-        return self.link_id_to_name[link_id]
-
-    def get_link_mass(self, link_name: str) -> float:
-        """Get the mass of the specified link (body)."""
-        return float(self.model.body_mass[self.get_link_id(link_name)])
-
-    def get_actuator_id(self, actuator_name: str) -> int:
-        """Get the id of the specified actuator."""
-        return self.actuator_name_to_id[actuator_name]
-
-    def get_site_id(self, site_name: str) -> int:
-        """Get the id of the specified site."""
-        return self.site_name_to_id[site_name]
+__all__ = [
+    "ContactInfo",
+    "Frame",
+    "MujocoJointInfo",
+    "MujocoObject",
+    "MujocoRobot",
+    "MujocoRobotState",
+    "QuatType",
+    "Vector3D",
+    "wrap_angle",
+    "wxyz_to_xyzw",
+    "xyzw_to_wxyz",
+]
 
 
 class MujocoRobot(MujocoObject):
@@ -811,7 +383,7 @@ class MujocoRobot(MujocoObject):
 
     def reset_joints(
         self,
-        joint_ids: List[int],
+        joint_ids: List[int | str],
         joint_positions: np.ndarray,
         joint_velocities: np.ndarray = None,
     ):
@@ -821,15 +393,14 @@ class MujocoRobot(MujocoObject):
         (no dynamics stepping). Only this robot's actuated joints may be given.
 
         Args:
-            joint_ids (List[int]): Joint ids to set.
+            joint_ids (List[int | str]): Joint ids or names to set.
             joint_positions (np.ndarray): Target positions, aligned with ``joint_ids``.
             joint_velocities (np.ndarray, optional): Target velocities. Defaults to zeros.
         """
         joint_positions = np.asarray(joint_positions, dtype=float)
-        self._check_own_joints(joint_ids)
+        infos = [self._own_joint_info(j) for j in joint_ids]
         with self._lock:
-            for n, jid in enumerate(joint_ids):
-                info = self.joint_name_to_info[self.joint_id_to_name[jid]]
+            for n, info in enumerate(infos):
                 self.data.qpos[info.qpos_adr] = joint_positions[n]
                 if joint_velocities is not None:
                     self.data.qvel[info.dof_adr] = joint_velocities[n]
@@ -840,7 +411,7 @@ class MujocoRobot(MujocoObject):
     def reset_actuated_joint_positions(
         self,
         joint_positions: np.ndarray = None,
-        joint_names: List[str] = None,
+        joint_names: List[str | int] = None,
         joint_velocities: np.ndarray = None,
     ):
         """Reset the actuated joints to the given positions (no controller; ``qpos`` + forward).
@@ -848,15 +419,15 @@ class MujocoRobot(MujocoObject):
         Args:
             joint_positions (np.ndarray, optional): Target positions, in the order of
                 ``joint_names``. Defaults to ``default_joint_positions``.
-            joint_names (List[str], optional): Joints to set, in the order of ``joint_positions``.
-                Defaults to all actuated joints.
+            joint_names (List[str | int], optional): Joint names or ids to set, in the order of
+                ``joint_positions``. Defaults to all actuated joints.
             joint_velocities (np.ndarray, optional): Target velocities. Defaults to zeros.
         """
         if joint_positions is None:
             joint_positions = self.default_joint_positions
         if joint_names is None:
-            joint_names = self.actuated_joint_names
-        self.reset_joints(self.get_joint_ids(joint_names), joint_positions, joint_velocities)
+            joint_names = self.actuated_joint_ids
+        self.reset_joints(joint_names, joint_positions, joint_velocities)
 
     def reset_base_pose(
         self,
@@ -888,7 +459,7 @@ class MujocoRobot(MujocoObject):
         position = np.asarray(position, dtype=float)
         with self._lock:
             if self.has_floating_base:
-                info = self.joint_name_to_info[self.joint_id_to_name[self.free_joint_id]]
+                info = self._joint_info_by_id[self.free_joint_id]
                 a, d = info.qpos_adr, info.dof_adr
                 self.data.qpos[a : a + 3] = position
                 self.data.qpos[a + 3 : a + 7] = xyzw_to_wxyz(orientation)
@@ -966,8 +537,8 @@ class MujocoRobot(MujocoObject):
             self._zero_own_qfrc_applied()
             self._managed_targets.clear()
             self._in_torque_mode = False
-            for name in self.actuated_joint_names:
-                info = self.joint_name_to_info[name]
+            for jid in self.actuated_joint_ids:
+                info = self._joint_info_by_id[jid]
                 if info.actuator_id is not None:
                     self.data.ctrl[info.actuator_id] = self.data.qpos[info.qpos_adr]
 
@@ -1014,7 +585,7 @@ class MujocoRobot(MujocoObject):
             self.data.ctrl[a] = 0.0
 
     def _zero_own_qfrc_applied(self):
-        """Zero ``qfrc_applied`` on the robot's dofs (all dofs when the robot is the whole model)."""
+        """Zero ``qfrc_applied`` on the robot's dofs (all dofs if the robot is the whole model)."""
         if self.is_scoped:
             self.data.qfrc_applied[self.actuated_joint_dof_adrs] = 0.0
         else:
@@ -1025,17 +596,14 @@ class MujocoRobot(MujocoObject):
         """Whether the robot is currently in effort/torque control mode."""
         return self._in_torque_mode
 
-    def _check_own_joints(self, joint_ids):
-        """Raise unless every id is one of this robot's actuated joints (others are never written)."""
-        foreign = [j for j in joint_ids if j not in self._actuated_joint_id_set]
-        if foreign:
-            names = [self.joint_id_to_name.get(int(j), str(j)) for j in foreign]
-            raise ValueError(f"Joints {names} are not actuated joints of this robot.")
-
-    def _own_joint_info(self, name: str) -> MujocoJointInfo:
-        info = self.joint_name_to_info.get(name)
+    def _own_joint_info(self, joint: int | str) -> MujocoJointInfo:
+        """Info for one of this robot's actuated joints, by name or id; others raise ValueError."""
+        try:
+            info = self._joint_info(joint)
+        except KeyError:
+            info = None
         if info is None or info.joint_id not in self._actuated_joint_id_set:
-            raise ValueError(f"'{name}' is not an actuated joint of this robot.")
+            raise ValueError(f"{joint!r} is not an actuated joint of this robot.")
         return info
 
     def _set_managed_target(self, info: MujocoJointInfo, q_des: Optional[float], dq_des: float):
@@ -1060,7 +628,7 @@ class MujocoRobot(MujocoObject):
                 return
             kp, kd = self.default_position_kp, self.default_position_kd
             for jid, (q_des, dq_des) in self._managed_targets.items():
-                info = self.joint_name_to_info[self.joint_id_to_name[jid]]
+                info = self._joint_info_by_id[jid]
                 tau = kd * (dq_des - self.data.qvel[info.dof_adr])
                 if q_des is not None:
                     err = q_des - self.data.qpos[info.qpos_adr]
@@ -1074,7 +642,7 @@ class MujocoRobot(MujocoObject):
         return np.full(n, float(cmd)) if cmd.ndim == 0 else cmd
 
     def set_joint_positions(
-        self, cmd: np.ndarray, actuated_joint_names: List[str] = None, vels: np.ndarray = None
+        self, cmd: np.ndarray, actuated_joint_names: List[str | int] = None, vels: np.ndarray = None
     ):
         """Command target positions for the given actuated joints (position control).
 
@@ -1084,12 +652,13 @@ class MujocoRobot(MujocoObject):
 
         Args:
             cmd (np.ndarray): Target joint positions.
-            actuated_joint_names (List[str], optional): Joints to command, in the order of ``cmd``.
+            actuated_joint_names (List[str | int], optional): Joint names or ids to command, in
+                the order of ``cmd``.
                 Defaults to all actuated joints.
             vels (np.ndarray, optional): Optional target velocities (used by the PD fallback).
         """
         if actuated_joint_names is None:
-            actuated_joint_names = self.actuated_joint_names
+            actuated_joint_names = self.actuated_joint_ids
         cmd = self._normalise_cmd(cmd, len(actuated_joint_names))
         infos = [self._own_joint_info(name) for name in actuated_joint_names]
         with self._lock:
@@ -1101,7 +670,7 @@ class MujocoRobot(MujocoObject):
                 else:
                     self._set_managed_target(info, float(cmd[i]), dq_des)
 
-    def set_joint_velocities(self, cmd: np.ndarray, actuated_joint_names: List[str] = None):
+    def set_joint_velocities(self, cmd: np.ndarray, actuated_joint_names: List[str | int] = None):
         """Command target velocities for the given actuated joints (velocity control).
 
         Implemented as a damping PD toward the target velocity via ``data.qfrc_applied`` (gain
@@ -1110,27 +679,29 @@ class MujocoRobot(MujocoObject):
 
         Args:
             cmd (np.ndarray): Target joint velocities.
-            actuated_joint_names (List[str], optional): Joints to command, in the order of ``cmd``.
+            actuated_joint_names (List[str | int], optional): Joint names or ids to command, in
+                the order of ``cmd``.
         """
         if actuated_joint_names is None:
-            actuated_joint_names = self.actuated_joint_names
+            actuated_joint_names = self.actuated_joint_ids
         cmd = self._normalise_cmd(cmd, len(actuated_joint_names))
         infos = [self._own_joint_info(name) for name in actuated_joint_names]
         with self._lock:
             for i, info in enumerate(infos):
                 self._set_managed_target(info, None, float(cmd[i]))
 
-    def set_joint_torques(self, cmd: np.ndarray, actuated_joint_names: List[str] = None):
+    def set_joint_torques(self, cmd: np.ndarray, actuated_joint_names: List[str | int] = None):
         """Command target torques/efforts for the given actuated joints (effort control).
 
         Writes ``data.qfrc_applied`` directly; intended for use in torque control mode.
 
         Args:
             cmd (np.ndarray): Target joint torques.
-            actuated_joint_names (List[str], optional): Joints to command, in the order of ``cmd``.
+            actuated_joint_names (List[str | int], optional): Joint names or ids to command, in
+                the order of ``cmd``.
         """
         if actuated_joint_names is None:
-            actuated_joint_names = self.actuated_joint_names
+            actuated_joint_names = self.actuated_joint_ids
         cmd = self._normalise_cmd(cmd, len(actuated_joint_names))
         infos = [self._own_joint_info(name) for name in actuated_joint_names]
         with self._lock:
@@ -1138,15 +709,18 @@ class MujocoRobot(MujocoObject):
                 self.data.qfrc_applied[info.dof_adr] = cmd[i]
                 self._managed_targets.pop(info.joint_id, None)
 
-    def set_joint_positions_delta(self, cmd: np.ndarray, actuated_joint_names: List[str] = None):
+    def set_joint_positions_delta(
+        self, cmd: np.ndarray, actuated_joint_names: List[str | int] = None
+    ):
         """Command a position increment relative to the current positions (experimental).
 
         Args:
             cmd (np.ndarray): Position deltas.
-            actuated_joint_names (List[str], optional): Joints to command, in the order of ``cmd``.
+            actuated_joint_names (List[str | int], optional): Joint names or ids to command, in
+                the order of ``cmd``.
         """
         if actuated_joint_names is None:
-            actuated_joint_names = self.actuated_joint_names
+            actuated_joint_names = self.actuated_joint_ids
         current = self.get_actuated_joint_positions(actuated_joint_names)
         self.set_joint_positions(
             current + self._normalise_cmd(cmd, len(actuated_joint_names)), actuated_joint_names
@@ -1154,7 +728,7 @@ class MujocoRobot(MujocoObject):
 
     def compute_joint_pd_error(
         self,
-        joint_ids: List[int],
+        joint_ids: List[int | str],
         q_des: np.ndarray,
         dq_des: np.ndarray,
         Kp: float | np.ndarray,
@@ -1165,7 +739,7 @@ class MujocoRobot(MujocoObject):
         Continuous joints use the wrapped position error. A None target zeroes that term.
 
         Args:
-            joint_ids (List[int]): Joints to compute the error for.
+            joint_ids (List[int | str]): Joint ids or names to compute the error for.
             q_des (np.ndarray): Desired positions (or None to skip the position term).
             dq_des (np.ndarray): Desired velocities (or None to skip the velocity term).
             Kp (float | np.ndarray): Position gain(s).
@@ -1174,6 +748,7 @@ class MujocoRobot(MujocoObject):
         Returns:
             np.ndarray: The PD term per joint.
         """
+        joint_ids = self._resolve_joint_ids(joint_ids)
         q, dq, _ = self.get_joint_states(joint_ids)
         p_term = np.zeros_like(q)
         if q_des is not None:
@@ -1190,7 +765,7 @@ class MujocoRobot(MujocoObject):
 
     def set_actuated_joint_commands(
         self,
-        actuated_joint_names: List[str] = None,
+        actuated_joint_names: List[str | int] = None,
         q: float | np.ndarray = 0,
         dq: float | np.ndarray = 0,
         Kp: float | np.ndarray = 0,
@@ -1205,7 +780,8 @@ class MujocoRobot(MujocoObject):
         because the model's actuators close the loop.
 
         Args:
-            actuated_joint_names (List[str], optional): Joints to command. Defaults to all.
+            actuated_joint_names (List[str | int], optional): Joint names or ids to command.
+                Defaults to all.
             q (float | np.ndarray, optional): Position command(s). Defaults to 0.
             dq (float | np.ndarray, optional): Velocity command(s). Defaults to 0.
             Kp (float | np.ndarray, optional): Stiffness gain(s). Defaults to 0.
@@ -1213,16 +789,15 @@ class MujocoRobot(MujocoObject):
             tau (float | np.ndarray, optional): Feedforward torque(s). Defaults to 0.
         """
         if actuated_joint_names is None:
-            actuated_joint_names = self.actuated_joint_names
-        joint_ids = self.get_joint_ids(actuated_joint_names)
-        self._check_own_joints(joint_ids)
+            actuated_joint_names = self.actuated_joint_ids
+        joint_ids = self._resolve_joint_ids(actuated_joint_names)  # KeyError if unknown
+        infos = [self._own_joint_info(jid) for jid in joint_ids]  # ValueError if not the robot's
         if self._in_torque_mode:
             tau_cmd = self.compute_joint_pd_error(joint_ids, q_des=q, dq_des=dq, Kp=Kp, Kd=Kd) + tau
             with self._lock:
-                for i, jid in enumerate(joint_ids):
-                    info = self.joint_name_to_info[self.joint_id_to_name[jid]]
+                for i, info in enumerate(infos):
                     self.data.qfrc_applied[info.dof_adr] = tau_cmd[i]
-                    self._managed_targets.pop(jid, None)
+                    self._managed_targets.pop(info.joint_id, None)
         else:
             vels = dq if np.ndim(dq) else None
             self.set_joint_positions(q, actuated_joint_names=actuated_joint_names, vels=vels)
@@ -1238,7 +813,7 @@ class MujocoRobot(MujocoObject):
     # --- joint state --------------------------------------------------------
 
     def get_joint_states(
-        self, joint_ids: List[int] = None
+        self, joint_ids: List[int | str] = None
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Get (positions, velocities, applied efforts) for the given joints.
 
@@ -1246,20 +821,21 @@ class MujocoRobot(MujocoObject):
         generalised force on the joint (``qfrc_actuator`` + ``qfrc_applied``).
 
         Args:
-            joint_ids (List[int], optional): Joints to read. Defaults to all actuated joints.
+            joint_ids (List[int | str], optional): Joint ids or names to read. Defaults to all
+                actuated joints.
 
         Returns:
             Tuple[np.ndarray, np.ndarray, np.ndarray]: positions, velocities, efforts.
         """
         if joint_ids is None:
             joint_ids = self.actuated_joint_ids
-        n = len(joint_ids)
+        infos = [self._joint_info(j) for j in joint_ids]
+        n = len(infos)
         q, v, tau = np.zeros(n), np.zeros(n), np.zeros(n)
         with self._lock:
-            for i, jid in enumerate(joint_ids):
-                info = self.joint_name_to_info[self.joint_id_to_name[jid]]
+            for i, info in enumerate(infos):
                 pos = self.data.qpos[info.qpos_adr]
-                q[i] = wrap_angle(pos) if jid in self.continuous_joint_ids else pos
+                q[i] = wrap_angle(pos) if info.joint_id in self.continuous_joint_ids else pos
                 v[i] = self.data.qvel[info.dof_adr]
                 tau[i] = (
                     self.data.qfrc_actuator[info.dof_adr]
@@ -1267,33 +843,39 @@ class MujocoRobot(MujocoObject):
                 )
         return q, v, tau
 
-    def get_actuated_joint_positions(self, actuated_joint_names: List[str] = None) -> np.ndarray:
-        """Get current positions of the actuated joints (defaults to all, in default order)."""
+    def get_actuated_joint_positions(
+        self, actuated_joint_names: List[str | int] = None
+    ) -> np.ndarray:
+        """Get current positions of the given joints (names or ids; defaults to all actuated)."""
         if actuated_joint_names is None:
-            actuated_joint_names = self.actuated_joint_names
-        return self.get_joint_states(self.get_joint_ids(actuated_joint_names))[0]
+            actuated_joint_names = self.actuated_joint_ids
+        return self.get_joint_states(actuated_joint_names)[0]
 
-    def get_actuated_joint_velocities(self, actuated_joint_names: List[str] = None) -> np.ndarray:
-        """Get current velocities of the actuated joints (defaults to all, in default order)."""
+    def get_actuated_joint_velocities(
+        self, actuated_joint_names: List[str | int] = None
+    ) -> np.ndarray:
+        """Get current velocities of the given joints (names or ids; defaults to all actuated)."""
         if actuated_joint_names is None:
-            actuated_joint_names = self.actuated_joint_names
-        return self.get_joint_states(self.get_joint_ids(actuated_joint_names))[1]
+            actuated_joint_names = self.actuated_joint_ids
+        return self.get_joint_states(actuated_joint_names)[1]
 
-    def get_actuated_joint_torques(self, actuated_joint_names: List[str] = None) -> np.ndarray:
-        """Get current efforts of the actuated joints (defaults to all, in default order)."""
+    def get_actuated_joint_torques(
+        self, actuated_joint_names: List[str | int] = None
+    ) -> np.ndarray:
+        """Get current efforts of the given joints (names or ids; defaults to all actuated)."""
         if actuated_joint_names is None:
-            actuated_joint_names = self.actuated_joint_names
-        return self.get_joint_states(self.get_joint_ids(actuated_joint_names))[2]
+            actuated_joint_names = self.actuated_joint_ids
+        return self.get_joint_states(actuated_joint_names)[2]
 
     def get_actuated_joint_accelerations(
-        self, actuated_joint_names: List[str] = None
+        self, actuated_joint_names: List[str | int] = None
     ) -> np.ndarray:
-        """Get current accelerations (``data.qacc``) of the actuated joints, in default order."""
+        """Get current accelerations (``data.qacc``) of the given joints (names or ids)."""
         if actuated_joint_names is None:
-            actuated_joint_names = self.actuated_joint_names
+            actuated_joint_names = self.actuated_joint_ids
         with self._lock:
             return np.array(
-                [self.data.qacc[self.joint_name_to_info[n].dof_adr] for n in actuated_joint_names]
+                [self.data.qacc[self._joint_info(j).dof_adr] for j in actuated_joint_names]
             )
 
     # --- base state ---------------------------------------------------------
@@ -1326,25 +908,44 @@ class MujocoRobot(MujocoObject):
 
     # --- link / site state --------------------------------------------------
 
-    def get_link_pose(self, link_id: int) -> Tuple[Vector3D, QuatType]:
-        """Get the world-frame link (body) pose as (position, orientation quaternion [x,y,z,w])."""
+    def get_link_pose(self, link_id: int | str) -> Tuple[Vector3D, QuatType]:
+        """Get the world-frame link (body) pose as (position, orientation quaternion [x,y,z,w]).
+
+        Args:
+            link_id (int | str): Link (body) id or name.
+        """
+        link_id = self._resolve_link_id(link_id)
         with self._lock:
             return np.array(self.data.xpos[link_id]), wxyz_to_xyzw(self.data.xquat[link_id])
 
-    def get_link_velocity(self, link_id: int) -> Tuple[Vector3D, Vector3D]:
-        """Get the world-frame link velocity as (linear velocity, angular velocity)."""
-        return self._object_velocity(link_id)
+    def get_link_velocity(self, link_id: int | str) -> Tuple[Vector3D, Vector3D]:
+        """Get the world-frame link velocity as (linear velocity, angular velocity).
 
-    def get_link_com_pose(self, link_id: int) -> Tuple[Vector3D, QuatType]:
-        """Get the world-frame pose of the link's centre of mass as (position, orientation)."""
+        Args:
+            link_id (int | str): Link (body) id or name.
+        """
+        return self._object_velocity(self._resolve_link_id(link_id))
+
+    def get_link_com_pose(self, link_id: int | str) -> Tuple[Vector3D, QuatType]:
+        """Get the world-frame pose of the link's centre of mass as (position, orientation).
+
+        Args:
+            link_id (int | str): Link (body) id or name.
+        """
+        link_id = self._resolve_link_id(link_id)
         quat = np.zeros(4)
         with self._lock:
             pos = np.array(self.data.xipos[link_id])
             mujoco.mju_mat2Quat(quat, self.data.ximat[link_id])
         return pos, wxyz_to_xyzw(quat)
 
-    def get_site_pose(self, site_id: int) -> Tuple[Vector3D, QuatType]:
-        """Get the world-frame pose of a site as (position, orientation quaternion [x,y,z,w])."""
+    def get_site_pose(self, site_id: int | str) -> Tuple[Vector3D, QuatType]:
+        """Get the world-frame pose of a site as (position, orientation quaternion [x,y,z,w]).
+
+        Args:
+            site_id (int | str): Site id or name.
+        """
+        site_id = self._resolve_site_id(site_id)
         quat = np.zeros(4)
         with self._lock:
             pos = np.array(self.data.site_xpos[site_id])
@@ -1353,26 +954,48 @@ class MujocoRobot(MujocoObject):
 
     # --- jacobian -----------------------------------------------------------
 
-    def _jacobian_from_data(self, data: mujoco.MjData, frame_name: str) -> np.ndarray:
+    def _as_frame(self, frame: str | Frame) -> Frame:
+        """A link-or-site argument as a Frame. Bare ids are refused: they cannot say which kind.
+
+        A Frame must be one this robot resolves for its name, so a handle from another robot or
+        model (or a hand-built one) cannot index the wrong element.
+        """
+        if isinstance(frame, Frame):
+            try:
+                own = self.frame(frame.name)
+            except KeyError:
+                own = None
+            if own != frame:
+                raise ValueError(f"{frame!r} is not a frame of this robot.")
+            return frame
+        if isinstance(frame, str):
+            return self.frame(frame)
+        raise TypeError(
+            f"Expected a link/site name or a Frame from robot.frame(name), got {frame!r}. A bare "
+            "id is ambiguous between a body id and a site id."
+        )
+
+    def _jacobian_from_data(self, data: mujoco.MjData, frame: Frame) -> np.ndarray:
         jacp = np.zeros((3, self.model.nv))
         jacr = np.zeros((3, self.model.nv))
-        if frame_name in self.link_name_to_id:
-            mujoco.mj_jacBody(self.model, data, jacp, jacr, self.link_name_to_id[frame_name])
-        elif frame_name in self.site_name_to_id:
-            mujoco.mj_jacSite(self.model, data, jacp, jacr, self.site_name_to_id[frame_name])
+        if frame.kind == "link":
+            mujoco.mj_jacBody(self.model, data, jacp, jacr, frame.id)
         else:
-            raise KeyError(f"No link or site named '{frame_name}'.")
+            mujoco.mj_jacSite(self.model, data, jacp, jacr, frame.id)
         cols = self.actuated_joint_dof_adrs
         return np.vstack([jacp[:, cols], jacr[:, cols]])
 
-    def get_jacobian(self, ee_link_name: str, joint_angles: np.ndarray = None) -> np.ndarray:
+    def get_jacobian(
+        self, ee_link_name: str | Frame, joint_angles: np.ndarray = None
+    ) -> np.ndarray:
         """Compute the 6xN geometric Jacobian (linear stacked over angular) for a frame.
 
-        The frame may be a link (body) name or a site name. Columns correspond to the actuated
-        joints, in ``actuated_joint_names`` order.
+        The frame may be a link (body) or a site, given by name or as a :class:`Frame` from
+        :meth:`frame`. Columns correspond to the actuated joints, in ``actuated_joint_names``
+        order.
 
         Args:
-            ee_link_name (str): Name of the link (body) or site to compute the Jacobian for.
+            ee_link_name (str | Frame): Link (body) or site to compute the Jacobian for.
             joint_angles (np.ndarray, optional): Actuated-joint configuration to evaluate at.
                 Defaults to None (use the current configuration). Evaluated on a scratch copy so
                 the live state is not disturbed.
@@ -1380,16 +1003,16 @@ class MujocoRobot(MujocoObject):
         Returns:
             np.ndarray: 6xN Jacobian matrix.
         """
+        frame = self._as_frame(ee_link_name)
         if joint_angles is None:
             with self._lock:
-                return self._jacobian_from_data(self.data, ee_link_name)
+                return self._jacobian_from_data(self.data, frame)
         with self._lock:
             scratch = self._get_scratch_data()
             scratch.qpos[:] = self.data.qpos
-            for i, name in enumerate(self.actuated_joint_names):
-                scratch.qpos[self.joint_name_to_info[name].qpos_adr] = joint_angles[i]
+            scratch.qpos[self.actuated_joint_qpos_adrs] = joint_angles
             mujoco.mj_forward(self.model, scratch)
-            return self._jacobian_from_data(scratch, ee_link_name)
+            return self._jacobian_from_data(scratch, frame)
 
     # --- dynamics -----------------------------------------------------------
 
@@ -1419,29 +1042,32 @@ class MujocoRobot(MujocoObject):
                 mujoco.mj_inverse(self.model, scratch)
                 bias = np.array(scratch.qfrc_inverse)
         return np.array(
-            [bias[self.joint_name_to_info[n].dof_adr] for n in self.actuated_joint_names]
+            [bias[adr] for adr in self.actuated_joint_dof_adrs]
         )
 
     # --- state bundle -------------------------------------------------------
 
     def get_robot_states(
-        self, actuated_joint_names: List[str] = None, ee_names: List[str] = None
+        self, actuated_joint_names: List[str | int] = None, ee_names: List[str | int] = None
     ) -> MujocoRobotState:
         """Get a consistent snapshot of common robot state.
 
         Args:
-            actuated_joint_names (List[str], optional): Joints to include. Defaults to all.
-            ee_names (List[str], optional): End-effectors to report the order of. Defaults to all.
+            actuated_joint_names (List[str | int], optional): Joint names or ids to include.
+                Defaults to all. Reported by name in ``joint_order``.
+            ee_names (List[str | int], optional): End-effector link names or ids to report.
+                Defaults to all. Reported by name in ``ee_order``.
 
         Returns:
             MujocoRobotState: The state snapshot.
         """
         if actuated_joint_names is None:
-            actuated_joint_names = self.actuated_joint_names
+            actuated_joint_names = self.actuated_joint_ids
         if ee_names is None:
             ee_names = self.ee_names
         with self._lock:
-            joint_ids = self.get_joint_ids(actuated_joint_names)
+            joint_ids = self._resolve_joint_ids(actuated_joint_names)
+            ee_ids = [self._resolve_link_id(e) for e in ee_names]
             base_pos, base_quat = self.get_base_pose()
             base_lin, base_ang = self.get_base_velocity()
             q, v, tau = self.get_joint_states(joint_ids)
@@ -1454,22 +1080,23 @@ class MujocoRobot(MujocoObject):
                 actuated_joint_positions=q,
                 actuated_joint_velocities=v,
                 actuated_joint_torques=tau,
-                joint_order=list(actuated_joint_names),
-                ee_order=list(ee_names),
-                ee_contact_states=self.get_ee_contact_states(ee_names),
+                joint_order=[self.joint_id_to_name[j] for j in joint_ids],
+                ee_order=[self.link_id_to_name[e] for e in ee_ids],
+                ee_contact_states=self.get_contact_states_of_links(ee_ids),
             )
 
     # --- contacts -----------------------------------------------------------
 
-    def get_contact_states_of_links(self, link_ids: List[int]) -> np.ndarray:
+    def get_contact_states_of_links(self, link_ids: List[int | str]) -> np.ndarray:
         """Binary contact state (1 = in contact, 0 = not) for each of the given links (bodies).
 
         Args:
-            link_ids (List[int]): Body ids to query.
+            link_ids (List[int | str]): Link (body) ids or names to query.
 
         Returns:
             np.ndarray: One 0/1 value per link, in the given order.
         """
+        link_ids = [self._resolve_link_id(link) for link in link_ids]
         with self._lock:
             touching = set()
             for c in range(self.data.ncon):
@@ -1478,11 +1105,11 @@ class MujocoRobot(MujocoObject):
                 touching.add(int(self.model.geom_bodyid[con.geom2]))
         return np.array([int(lid in touching) for lid in link_ids])
 
-    def get_ee_contact_states(self, ee_names: List[str] = None) -> np.ndarray:
+    def get_ee_contact_states(self, ee_names: List[str | int] = None) -> np.ndarray:
         """Binary contact state for the given end-effectors (defaults to the configured ones)."""
         if ee_names is None:
             ee_names = self.ee_names
-        return self.get_contact_states_of_links([self.get_link_id(n) for n in ee_names])
+        return self.get_contact_states_of_links(ee_names)
 
     def get_link_contact_force(self, link) -> Vector3D:
         """Net world-frame contact force acting on the given link (body).
@@ -1497,7 +1124,7 @@ class MujocoRobot(MujocoObject):
         Returns:
             Vector3D: Net contact force in the world frame.
         """
-        lid = link if isinstance(link, (int, np.integer)) else self.get_link_id(link)
+        lid = self._resolve_link_id(link)
         net = np.zeros(3)
         f6 = np.zeros(6)
         with self._lock:
@@ -1540,9 +1167,13 @@ class MujocoRobot(MujocoObject):
 
     # --- force-torque sensors -----------------------------------------------
 
-    def has_ft_sensor(self, link_name: str) -> bool:
-        """Whether a force-torque sensor was compiled in for the given link."""
-        return f"{link_name}_force" in self.sensor_name_to_id
+    def _ft_link_name(self, link: int | str) -> str:
+        """Force-torque sensors are keyed by link name; an id is converted to its body name."""
+        return self.body_id_to_name[int(link)] if self._is_id(link) else link
+
+    def has_ft_sensor(self, link_name: int | str) -> bool:
+        """Whether a force-torque sensor was compiled in for the given link (name or id)."""
+        return f"{self._ft_link_name(link_name)}_force" in self.sensor_name_to_id
 
     def _read_sensor(self, name: str) -> np.ndarray:
         sid = self.sensor_name_to_id[name]
@@ -1550,12 +1181,13 @@ class MujocoRobot(MujocoObject):
         dim = int(self.model.sensor_dim[sid])
         return np.array(self.data.sensordata[adr : adr + dim])
 
-    def get_link_ft_measurement(self, link_name: str) -> np.ndarray:
+    def get_link_ft_measurement(self, link_name: int | str) -> np.ndarray:
         """Force-torque reading for a link as a 6D wrench ``[fx,fy,fz,tx,ty,tz]`` (site frame).
 
-        Returns zeros if the link has no force-torque sensor (see ``ft_sensor_links``) or its
-        sensor has been disabled via ``toggle_ft_sensor_for_links``.
+        The link is given by name or id. Returns zeros if the link has no force-torque sensor (see
+        ``ft_sensor_links``) or its sensor has been disabled via ``toggle_ft_sensor_for_links``.
         """
+        link_name = self._ft_link_name(link_name)
         if link_name not in self._ft_enabled_links or not self.has_ft_sensor(link_name):
             return np.zeros(6)
         with self._lock:
@@ -1575,7 +1207,7 @@ class MujocoRobot(MujocoObject):
             buffer.append(self._read_ft_raw(link))
 
     def get_ft_reading(
-        self, in_global_frame: bool = True, sensor_name: str = None
+        self, in_global_frame: bool = True, sensor_name: int | str = None
     ) -> Tuple[Vector3D, Vector3D]:
         """Force-torque reading as ``(force[3], torque[3])``, expressed on the parent body.
 
@@ -1588,13 +1220,14 @@ class MujocoRobot(MujocoObject):
             in_global_frame (bool, optional): Rotate the wrench into the world frame using the
                 sensor site's orientation. If the site is unavailable, warns and returns the
                 sensor-frame values. Defaults to True.
-            sensor_name (str, optional): Instrumented link name. Defaults to the first instrumented
+            sensor_name (int | str, optional): Instrumented link name or id. Defaults to the first
+                instrumented
                 link.
 
         Returns:
             Tuple[Vector3D, Vector3D]: (force, torque).
         """
-        link = sensor_name if sensor_name is not None else (
+        link = self._ft_link_name(sensor_name) if sensor_name is not None else (
             self.ft_sensor_links[0] if self.ft_sensor_links else None
         )
         if link is None or not self.has_ft_sensor(link):
@@ -1618,11 +1251,12 @@ class MujocoRobot(MujocoObject):
                     force, torque = rot @ force, rot @ torque
         return force, torque
 
-    def get_joint_ft_measurements(self, joint_ids: List[int] = None) -> np.ndarray:
+    def get_joint_ft_measurements(self, joint_ids: List[int | str] = None) -> np.ndarray:
         """Force-torque wrench transmitted at each joint (measured at the joint's child link).
 
         Args:
-            joint_ids (List[int], optional): Joints to query. Defaults to all actuated joints.
+            joint_ids (List[int | str], optional): Joint ids or names to query. Defaults to all
+                actuated joints.
 
         Returns:
             np.ndarray: An (N, 6) array of ``[fx,fy,fz,tx,ty,tz]`` per joint (zeros where no
@@ -1630,19 +1264,20 @@ class MujocoRobot(MujocoObject):
         """
         if joint_ids is None:
             joint_ids = self.actuated_joint_ids
-        out = np.zeros((len(joint_ids), 6))
-        for i, jid in enumerate(joint_ids):
-            link_name = self.body_id_to_name[int(self.model.jnt_bodyid[jid])]
-            out[i] = self.get_link_ft_measurement(link_name)
+        infos = [self._joint_info(j) for j in joint_ids]
+        out = np.zeros((len(infos), 6))
+        for i, info in enumerate(infos):
+            out[i] = self.get_link_ft_measurement(info.body_name)
         return out
 
     def get_full_joint_states(
-        self, joint_ids: List[int] = None
+        self, joint_ids: List[int | str] = None
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """Get joint positions, velocities, force-torque measurements, and efforts.
 
         Args:
-            joint_ids (List[int], optional): Joints to read. Defaults to all actuated joints.
+            joint_ids (List[int | str], optional): Joint ids or names to read. Defaults to all
+                actuated joints.
 
         Returns:
             Tuple: (positions, velocities, (N,6) force-torque measurements, efforts).
@@ -1658,12 +1293,12 @@ class MujocoRobot(MujocoObject):
         return the sensor value or zeros. Declare the sensors up front with ``ft_sensor_links``.
 
         Args:
-            link_names (str | List[str]): Link name(s).
+            link_names (str | int | List[str | int]): Link name(s) or id(s).
             enable (bool, optional): True to read, False to return zeros. Defaults to True.
         """
-        if isinstance(link_names, str):
+        if isinstance(link_names, str) or self._is_id(link_names):
             link_names = [link_names]
-        for name in link_names:
+        for name in (self._ft_link_name(link) for link in link_names):
             if enable and self.has_ft_sensor(name):
                 self._ft_enabled_links.add(name)
             else:
@@ -1675,12 +1310,12 @@ class MujocoRobot(MujocoObject):
         See ``toggle_ft_sensor_for_links``; sensors are compile-time, so this only gates reading.
 
         Args:
-            joint_ids (int | List[int]): Joint id(s).
+            joint_ids (int | str | List[int | str]): Joint id(s) or name(s).
             enable (bool, optional): True to read, False to return zeros. Defaults to True.
         """
-        if isinstance(joint_ids, (int, np.integer)):
+        if isinstance(joint_ids, str) or self._is_id(joint_ids):
             joint_ids = [joint_ids]
-        links = [self.body_id_to_name[int(self.model.jnt_bodyid[j])] for j in joint_ids]
+        links = [self._joint_info(j).body_name for j in joint_ids]
         self.toggle_ft_sensor_for_links(links, enable)
 
     # --- cosmetics / dynamics -----------------------------------------------
@@ -1710,8 +1345,7 @@ class MujocoRobot(MujocoObject):
             geom (int | str): Geom id or name.
             enabled (bool): True to collide, False to disable collisions.
         """
-        gid = geom if isinstance(geom, (int, np.integer)) else self.geom_name_to_id[geom]
-        gid = int(gid)
+        gid = self._resolve_geom_id(geom)
         with self._lock:
             if enabled:
                 if gid in self._saved_geom_masks:
@@ -1730,24 +1364,28 @@ class MujocoRobot(MujocoObject):
     # --- dynamics editing (domain randomisation) ----------------------------
     #
     # These edit the compiled model directly, addressed by MuJoCo object type and MuJoCo field
-    # names. They are restricted to the robot's own elements and are safe to call between steps.
+    # names. Elements are given by name or id (ids reach unnamed geoms). They are restricted to the
+    # robot's own elements and are safe to call between steps.
 
-    def _robot_geom_id(self, geom_name: str) -> int:
-        gid = self.geom_name_to_id.get(geom_name)
+    def _robot_geom_id(self, geom: int | str) -> int:
+        gid = int(geom) if self._is_id(geom) else self.geom_name_to_id.get(geom)
         if gid is None or gid not in self.robot_geom_ids:
-            raise ValueError(f"'{geom_name}' is not a geom belonging to this robot.")
+            raise ValueError(f"{geom!r} is not a geom belonging to this robot.")
         return gid
 
-    def _robot_body_id(self, body_name: str) -> int:
-        bid = self.body_name_to_id.get(body_name)
+    def _robot_body_id(self, body: int | str) -> int:
+        bid = int(body) if self._is_id(body) else self.body_name_to_id.get(body)
         if bid is None or bid not in self.link_ids:
-            raise ValueError(f"'{body_name}' is not a body belonging to this robot.")
+            raise ValueError(f"{body!r} is not a body belonging to this robot.")
         return bid
 
-    def _robot_joint_info(self, joint_name: str) -> MujocoJointInfo:
-        info = self.joint_name_to_info.get(joint_name)
+    def _robot_joint_info(self, joint: int | str) -> MujocoJointInfo:
+        try:
+            info = self._joint_info(joint)
+        except KeyError:
+            info = None
         if info is None or info.body_id not in self.link_ids:
-            raise ValueError(f"'{joint_name}' is not a joint belonging to this robot.")
+            raise ValueError(f"{joint!r} is not a joint belonging to this robot.")
         return info
 
     def _write_geom_friction(self, geom_name, friction):
@@ -1783,45 +1421,45 @@ class MujocoRobot(MujocoObject):
                 break
             b = int(self.model.body_parentid[b])
 
-    def set_geom_friction(self, geom_name: str, friction):
+    def set_geom_friction(self, geom_name: int | str, friction):
         """Set a robot geom's friction. Scalar sets sliding friction; a 3-vector sets all three."""
         with self._lock:
             self._write_geom_friction(geom_name, friction)
             mujoco.mj_forward(self.model, self.data)
 
-    def set_geom_solref(self, geom_name: str, solref):
+    def set_geom_solref(self, geom_name: int | str, solref):
         """Set a robot geom's contact solver reference ``[timeconst, dampratio]`` (contact softness)."""
         gid = self._robot_geom_id(geom_name)
         with self._lock:
             self.model.geom_solref[gid] = solref
             mujoco.mj_forward(self.model, self.data)
 
-    def set_geom_solimp(self, geom_name: str, solimp):
+    def set_geom_solimp(self, geom_name: int | str, solimp):
         """Set a robot geom's contact solver impedance (5-vector)."""
         gid = self._robot_geom_id(geom_name)
         with self._lock:
             self.model.geom_solimp[gid] = solimp
             mujoco.mj_forward(self.model, self.data)
 
-    def set_dof_damping(self, joint_name: str, value):
+    def set_dof_damping(self, joint_name: int | str, value):
         """Set the joint's dof damping (per-dof array required for multi-dof joints)."""
         with self._lock:
             self._write_dof_field("dof_damping", joint_name, value)
             mujoco.mj_forward(self.model, self.data)
 
-    def set_dof_frictionloss(self, joint_name: str, value):
+    def set_dof_frictionloss(self, joint_name: int | str, value):
         """Set the joint's dof friction loss (per-dof array required for multi-dof joints)."""
         with self._lock:
             self._write_dof_field("dof_frictionloss", joint_name, value)
             mujoco.mj_forward(self.model, self.data)
 
-    def set_dof_armature(self, joint_name: str, value):
+    def set_dof_armature(self, joint_name: int | str, value):
         """Set the joint's dof armature (per-dof array required for multi-dof joints)."""
         with self._lock:
             self._write_dof_field("dof_armature", joint_name, value)
             mujoco.mj_forward(self.model, self.data)
 
-    def set_body_mass(self, body_name: str, mass: float, *, scale_inertia: bool = True):
+    def set_body_mass(self, body_name: int | str, mass: float, *, scale_inertia: bool = True):
         """Set a robot body's mass (cheap live path for small perturbations / randomisation).
 
         Scales the body's inertia by the same ratio (unless ``scale_inertia=False``) and fixes the
@@ -1864,11 +1502,11 @@ class MujocoRobot(MujocoObject):
         dof_armature: dict = None,
         body_mass: dict = None,
     ):
-        """Batch dynamics randomisation. Each argument is a ``{element_name: value}`` dict.
+        """Batch dynamics randomisation. Each argument is a ``{element: value}`` dict.
 
-        Dispatches over the per-field setters (geom fields keyed by geom name, dof fields by joint
-        name, ``body_mass`` by body name using the cheap live path), then does a single
-        ``mj_forward`` at the end rather than one per field.
+        Dispatches over the per-field setters (geom fields keyed by geom, dof fields by joint,
+        ``body_mass`` by body, each as a name or id; mass uses the cheap live path), then does a
+        single ``mj_forward`` at the end rather than one per field.
         """
         with self._lock:
             for name, value in (geom_friction or {}).items():
