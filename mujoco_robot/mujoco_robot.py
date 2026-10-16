@@ -411,7 +411,7 @@ class MujocoRobot(MujocoObject):
     def reset_actuated_joint_positions(
         self,
         joint_positions: np.ndarray = None,
-        joint_names: List[str] = None,
+        joint_names: List[str | int] = None,
         joint_velocities: np.ndarray = None,
     ):
         """Reset the actuated joints to the given positions (no controller; ``qpos`` + forward).
@@ -426,7 +426,7 @@ class MujocoRobot(MujocoObject):
         if joint_positions is None:
             joint_positions = self.default_joint_positions
         if joint_names is None:
-            joint_names = self.actuated_joint_names
+            joint_names = self.actuated_joint_ids
         self.reset_joints(joint_names, joint_positions, joint_velocities)
 
     def reset_base_pose(
@@ -642,7 +642,7 @@ class MujocoRobot(MujocoObject):
         return np.full(n, float(cmd)) if cmd.ndim == 0 else cmd
 
     def set_joint_positions(
-        self, cmd: np.ndarray, actuated_joint_names: List[str] = None, vels: np.ndarray = None
+        self, cmd: np.ndarray, actuated_joint_names: List[str | int] = None, vels: np.ndarray = None
     ):
         """Command target positions for the given actuated joints (position control).
 
@@ -658,7 +658,7 @@ class MujocoRobot(MujocoObject):
             vels (np.ndarray, optional): Optional target velocities (used by the PD fallback).
         """
         if actuated_joint_names is None:
-            actuated_joint_names = self.actuated_joint_names
+            actuated_joint_names = self.actuated_joint_ids
         cmd = self._normalise_cmd(cmd, len(actuated_joint_names))
         infos = [self._own_joint_info(name) for name in actuated_joint_names]
         with self._lock:
@@ -670,7 +670,7 @@ class MujocoRobot(MujocoObject):
                 else:
                     self._set_managed_target(info, float(cmd[i]), dq_des)
 
-    def set_joint_velocities(self, cmd: np.ndarray, actuated_joint_names: List[str] = None):
+    def set_joint_velocities(self, cmd: np.ndarray, actuated_joint_names: List[str | int] = None):
         """Command target velocities for the given actuated joints (velocity control).
 
         Implemented as a damping PD toward the target velocity via ``data.qfrc_applied`` (gain
@@ -683,14 +683,14 @@ class MujocoRobot(MujocoObject):
                 the order of ``cmd``.
         """
         if actuated_joint_names is None:
-            actuated_joint_names = self.actuated_joint_names
+            actuated_joint_names = self.actuated_joint_ids
         cmd = self._normalise_cmd(cmd, len(actuated_joint_names))
         infos = [self._own_joint_info(name) for name in actuated_joint_names]
         with self._lock:
             for i, info in enumerate(infos):
                 self._set_managed_target(info, None, float(cmd[i]))
 
-    def set_joint_torques(self, cmd: np.ndarray, actuated_joint_names: List[str] = None):
+    def set_joint_torques(self, cmd: np.ndarray, actuated_joint_names: List[str | int] = None):
         """Command target torques/efforts for the given actuated joints (effort control).
 
         Writes ``data.qfrc_applied`` directly; intended for use in torque control mode.
@@ -701,7 +701,7 @@ class MujocoRobot(MujocoObject):
                 the order of ``cmd``.
         """
         if actuated_joint_names is None:
-            actuated_joint_names = self.actuated_joint_names
+            actuated_joint_names = self.actuated_joint_ids
         cmd = self._normalise_cmd(cmd, len(actuated_joint_names))
         infos = [self._own_joint_info(name) for name in actuated_joint_names]
         with self._lock:
@@ -709,7 +709,9 @@ class MujocoRobot(MujocoObject):
                 self.data.qfrc_applied[info.dof_adr] = cmd[i]
                 self._managed_targets.pop(info.joint_id, None)
 
-    def set_joint_positions_delta(self, cmd: np.ndarray, actuated_joint_names: List[str] = None):
+    def set_joint_positions_delta(
+        self, cmd: np.ndarray, actuated_joint_names: List[str | int] = None
+    ):
         """Command a position increment relative to the current positions (experimental).
 
         Args:
@@ -718,7 +720,7 @@ class MujocoRobot(MujocoObject):
                 the order of ``cmd``.
         """
         if actuated_joint_names is None:
-            actuated_joint_names = self.actuated_joint_names
+            actuated_joint_names = self.actuated_joint_ids
         current = self.get_actuated_joint_positions(actuated_joint_names)
         self.set_joint_positions(
             current + self._normalise_cmd(cmd, len(actuated_joint_names)), actuated_joint_names
@@ -763,7 +765,7 @@ class MujocoRobot(MujocoObject):
 
     def set_actuated_joint_commands(
         self,
-        actuated_joint_names: List[str] = None,
+        actuated_joint_names: List[str | int] = None,
         q: float | np.ndarray = 0,
         dq: float | np.ndarray = 0,
         Kp: float | np.ndarray = 0,
@@ -787,7 +789,7 @@ class MujocoRobot(MujocoObject):
             tau (float | np.ndarray, optional): Feedforward torque(s). Defaults to 0.
         """
         if actuated_joint_names is None:
-            actuated_joint_names = self.actuated_joint_names
+            actuated_joint_names = self.actuated_joint_ids
         joint_ids = self._resolve_joint_ids(actuated_joint_names)  # KeyError if unknown
         infos = [self._own_joint_info(jid) for jid in joint_ids]  # ValueError if not the robot's
         if self._in_torque_mode:
@@ -846,7 +848,7 @@ class MujocoRobot(MujocoObject):
     ) -> np.ndarray:
         """Get current positions of the given joints (names or ids; defaults to all actuated)."""
         if actuated_joint_names is None:
-            actuated_joint_names = self.actuated_joint_names
+            actuated_joint_names = self.actuated_joint_ids
         return self.get_joint_states(actuated_joint_names)[0]
 
     def get_actuated_joint_velocities(
@@ -854,7 +856,7 @@ class MujocoRobot(MujocoObject):
     ) -> np.ndarray:
         """Get current velocities of the given joints (names or ids; defaults to all actuated)."""
         if actuated_joint_names is None:
-            actuated_joint_names = self.actuated_joint_names
+            actuated_joint_names = self.actuated_joint_ids
         return self.get_joint_states(actuated_joint_names)[1]
 
     def get_actuated_joint_torques(
@@ -862,7 +864,7 @@ class MujocoRobot(MujocoObject):
     ) -> np.ndarray:
         """Get current efforts of the given joints (names or ids; defaults to all actuated)."""
         if actuated_joint_names is None:
-            actuated_joint_names = self.actuated_joint_names
+            actuated_joint_names = self.actuated_joint_ids
         return self.get_joint_states(actuated_joint_names)[2]
 
     def get_actuated_joint_accelerations(
@@ -870,7 +872,7 @@ class MujocoRobot(MujocoObject):
     ) -> np.ndarray:
         """Get current accelerations (``data.qacc``) of the given joints (names or ids)."""
         if actuated_joint_names is None:
-            actuated_joint_names = self.actuated_joint_names
+            actuated_joint_names = self.actuated_joint_ids
         with self._lock:
             return np.array(
                 [self.data.qacc[self._joint_info(j).dof_adr] for j in actuated_joint_names]
@@ -953,8 +955,18 @@ class MujocoRobot(MujocoObject):
     # --- jacobian -----------------------------------------------------------
 
     def _as_frame(self, frame: str | Frame) -> Frame:
-        """A link-or-site argument as a Frame. Bare ids are refused: they cannot say which kind."""
+        """A link-or-site argument as a Frame. Bare ids are refused: they cannot say which kind.
+
+        A Frame must be one this robot resolves for its name, so a handle from another robot or
+        model (or a hand-built one) cannot index the wrong element.
+        """
         if isinstance(frame, Frame):
+            try:
+                own = self.frame(frame.name)
+            except KeyError:
+                own = None
+            if own != frame:
+                raise ValueError(f"{frame!r} is not a frame of this robot.")
             return frame
         if isinstance(frame, str):
             return self.frame(frame)
@@ -1050,7 +1062,7 @@ class MujocoRobot(MujocoObject):
             MujocoRobotState: The state snapshot.
         """
         if actuated_joint_names is None:
-            actuated_joint_names = self.actuated_joint_names
+            actuated_joint_names = self.actuated_joint_ids
         if ee_names is None:
             ee_names = self.ee_names
         with self._lock:

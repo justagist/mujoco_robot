@@ -290,9 +290,9 @@ def test_jacobian_link_pose_and_contacts_on_scoped_links():
             np.testing.assert_allclose(r.get_link_pose(link)[0], [0.0, 0.0, 0.65], atol=1e-12)
         for site in (model.site("arm/tcp").id, "arm/tcp"):
             np.testing.assert_allclose(r.get_site_pose(site)[0], [0.0, 0.0, 0.95], atol=1e-12)
-        np.testing.assert_allclose(
-            r.get_link_com_pose("arm/link1")[0], r.get_link_com_pose(r.get_link_id("arm/link1"))[0]
-        )
+        # link1's capsule runs 0.3 up from its origin (0.05 above the base), so its COM is 0.2 up.
+        for link in (r.get_link_id("arm/link1"), "arm/link1"):
+            np.testing.assert_allclose(r.get_link_com_pose(link)[0], [0.0, 0.0, 0.5], atol=1e-12)
 
         # Jacobian columns are the two arm joints: check against finite differences of the tcp.
         q0 = np.array([0.3, -0.5])
@@ -318,6 +318,22 @@ def test_jacobian_link_pose_and_contacts_on_scoped_links():
         assert r.get_contact_states_of_links([link1, link2]).tolist() == [0, 1]
         assert r.get_contact_states_of_links(["arm/link1", "arm/link2"]).tolist() == [0, 1]
         assert r.get_link_contact_force("arm/link2")[2] > 0.0
+    finally:
+        r.shutdown()
+
+
+def test_link_ids_resolve_only_to_robot_links():
+    """Link ids follow the same rule as link names: only this robot's own links resolve."""
+    model, data = build_world()
+    r = wrap(model, data)
+    try:
+        for bad in (model.body("box0").id, 0, -1, model.nbody):  # foreign, world, negative, range
+            with pytest.raises(KeyError):
+                r.get_link_pose(bad)
+        with pytest.raises(KeyError):
+            r.get_link_pose("box0")
+        with pytest.raises(KeyError):
+            r.get_site_pose(-1)  # negative ids no longer wrap around
     finally:
         r.shutdown()
 

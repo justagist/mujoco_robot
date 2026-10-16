@@ -64,8 +64,9 @@ def test_set_geom_friction_scalar_and_vector():
     try:
         gid = r.robot_geom_ids[0]  # Panda's geoms are unnamed, so address it by id
         assert not r.geom_id_to_name[gid]
+        friction0 = np.array(r.model.geom_friction[gid])
         r.set_geom_friction(gid, 1.5)  # scalar -> sliding only
-        assert np.isclose(r.model.geom_friction[gid, 0], 1.5)
+        np.testing.assert_allclose(r.model.geom_friction[gid], [1.5, *friction0[1:]])
         r.set_geom_friction(np.int32(gid), [0.8, 0.02, 0.001])  # ids from model arrays are numpy
         assert np.allclose(r.model.geom_friction[gid], [0.8, 0.02, 0.001])
     finally:

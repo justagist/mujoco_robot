@@ -347,25 +347,42 @@ class MujocoObject:
     # --- name-or-id resolution ----------------------------------------------
     #
     # Methods bound to one kind of element take a name or that kind's id. Numpy integers count as
-    # ids (ids read from model arrays are numpy types). Unknown names raise KeyError.
+    # ids (ids read from model arrays are numpy types). Unknown names and invalid ids raise
+    # KeyError. Links resolve only to this object's own links, by name or by id. Names are looked
+    # up in the name->id maps, which leave out unnamed elements, so "" never resolves.
 
     @staticmethod
     def _is_id(x) -> bool:
         return isinstance(x, (int, np.integer)) and not isinstance(x, bool)
 
+    @staticmethod
+    def _checked_id(x, n: int, kind: str) -> int:
+        i = int(x)
+        if not 0 <= i < n:
+            raise KeyError(f"No {kind} with id {i}.")
+        return i
+
     def _resolve_link_id(self, link: int | str) -> int:
-        return int(link) if self._is_id(link) else self.link_name_to_id[link]
+        if not self._is_id(link):
+            return self.link_name_to_id[link]
+        if int(link) not in self.link_id_to_name:
+            raise KeyError(f"Body id {int(link)} is not a link of this robot.")
+        return int(link)
 
     def _resolve_site_id(self, site: int | str) -> int:
-        return int(site) if self._is_id(site) else self.site_name_to_id[site]
+        if self._is_id(site):
+            return self._checked_id(site, self.model.nsite, "site")
+        return self.site_name_to_id[site]
 
     def _resolve_geom_id(self, geom: int | str) -> int:
-        return int(geom) if self._is_id(geom) else self.geom_name_to_id[geom]
+        if self._is_id(geom):
+            return self._checked_id(geom, self.model.ngeom, "geom")
+        return self.geom_name_to_id[geom]
 
     def _joint_info(self, joint: int | str) -> MujocoJointInfo:
         if self._is_id(joint):
             return self._joint_info_by_id[int(joint)]
-        return self.joint_name_to_info[joint]
+        return self._joint_info_by_id[self.joint_name_to_id[joint]]
 
     def _resolve_joint_ids(self, joints) -> List[int]:
         return [self._joint_info(j).joint_id for j in joints]
