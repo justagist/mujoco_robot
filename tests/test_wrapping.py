@@ -281,12 +281,18 @@ def test_jacobian_link_pose_and_contacts_on_scoped_links():
     r = wrap(model, data)
     try:
         adrs = r.actuated_joint_qpos_adrs
-        # Link pose from known geometry: upright arm, link2 sits 0.05 + 0.3 above the base.
+        # Poses from known geometry: upright arm, link2 sits 0.05 + 0.3 above the base and the
+        # tcp a further 0.3. Names and ids must give the same frames.
         data.qpos[adrs] = [0.0, 0.0]
         mujoco.mj_forward(model, data)
         link2 = r.get_link_id("arm/link2")
-        pos, _ = r.get_link_pose(link2)
-        np.testing.assert_allclose(pos, [0.0, 0.0, 0.65], atol=1e-12)
+        for link in (link2, "arm/link2"):
+            np.testing.assert_allclose(r.get_link_pose(link)[0], [0.0, 0.0, 0.65], atol=1e-12)
+        for site in (model.site("arm/tcp").id, "arm/tcp"):
+            np.testing.assert_allclose(r.get_site_pose(site)[0], [0.0, 0.0, 0.95], atol=1e-12)
+        np.testing.assert_allclose(
+            r.get_link_com_pose("arm/link1")[0], r.get_link_com_pose(r.get_link_id("arm/link1"))[0]
+        )
 
         # Jacobian columns are the two arm joints: check against finite differences of the tcp.
         q0 = np.array([0.3, -0.5])
@@ -310,6 +316,7 @@ def test_jacobian_link_pose_and_contacts_on_scoped_links():
         mujoco.mj_forward(model, data)
         link1 = r.get_link_id("arm/link1")
         assert r.get_contact_states_of_links([link1, link2]).tolist() == [0, 1]
+        assert r.get_contact_states_of_links(["arm/link1", "arm/link2"]).tolist() == [0, 1]
         assert r.get_link_contact_force("arm/link2")[2] > 0.0
     finally:
         r.shutdown()

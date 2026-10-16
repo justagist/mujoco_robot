@@ -6,8 +6,10 @@ and the (linear, angular) ordering of velocities.
 
 import mujoco
 import numpy as np
+import pytest
 
 from mujoco_robot import MujocoRobot
+from mujoco_robot.utils import model_builder as mb
 from mujoco_robot.utils.robot_loader_utils import get_mjcf_from_awesome_robot_descriptions
 
 PANDA = get_mjcf_from_awesome_robot_descriptions("panda_mj_description")
@@ -174,5 +176,43 @@ def test_robot_states_bundle():
         assert state.actuated_joint_torques.shape == (9,)
         assert state.joint_order == r.actuated_joint_names
         assert state.ee_order == ["hand"]
+    finally:
+        r.shutdown()
+
+
+def test_joint_methods_accept_names_and_ids():
+    r = make()
+    try:
+        names = [f"joint{i}" for i in range(1, 8)]
+        ids = np.array(r.get_joint_ids(names), dtype=np.int32)  # numpy ids, as from model arrays
+        target = np.linspace(-0.6, 0.6, 7)  # distinct per joint, so a wrong mapping would show
+        r.reset_joints(names, target)
+        np.testing.assert_allclose(r.get_joint_states(ids)[0], target)
+        np.testing.assert_allclose(r.get_actuated_joint_positions(ids), target)
+        assert r.get_robot_states(actuated_joint_names=ids).joint_order == names
+
+        r.set_joint_positions(target[::-1], actuated_joint_names=names)
+        by_name = r.data.ctrl.copy()
+        r.set_joint_positions(target[::-1], actuated_joint_names=ids)
+        np.testing.assert_array_equal(r.data.ctrl, by_name)
+    finally:
+        r.shutdown()
+
+
+def test_frame_handle_for_any_frame_methods():
+    spec = mb.load_spec(mjcf_path=PANDA)
+    mb.add_site(spec, "hand", "tcp", pos=(0.0, 0.0, 0.1))  # a tool site offset from the hand body
+    r = MujocoRobot(model=spec.compile(), verbose=False)
+    try:
+        mujoco.mj_forward(r.model, r.data)  # wrapping leaves fresh data as it is
+        hand, tcp = r.frame("hand"), r.frame("tcp")
+        assert (hand.kind, hand.id) == ("link", r.get_link_id("hand"))
+        assert (tcp.kind, tcp.id) == ("site", r.get_site_id("tcp"))
+        np.testing.assert_array_equal(r.get_jacobian(tcp), r.get_jacobian("tcp"))
+        assert not np.allclose(r.get_jacobian(tcp), r.get_jacobian(hand))  # kinds not mixed up
+        with pytest.raises(TypeError):
+            r.get_jacobian(tcp.id)  # a bare id cannot say whether it is a body or a site
+        with pytest.raises(KeyError):
+            r.frame("not_a_frame")
     finally:
         r.shutdown()

@@ -6,6 +6,19 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Entries tagged **[BREAKING]** can change the behaviour of
 existing code.
 
+## [Unreleased]
+
+### Added
+
+- `robot.frame(name)` returns a typed link-or-site handle (`Frame`) that `get_jacobian` accepts.
+
+### Changed
+
+- Methods bound to one kind of element (links, sites, joints, geoms, bodies) accept a name or an
+  id, including numpy integer ids. Geom ids make dynamics editing work on unnamed geoms.
+- `get_jacobian` raises `TypeError` for a bare id, which cannot say whether it is a body or a
+  site; pass a name or a `Frame`.
+
 ## [0.2.0] - 2026-10-16
 
 ### Added
@@ -57,6 +70,7 @@ existing code.
 - First release: `MujocoRobot` and `MujocoObject` with loading, stepping, state getters,
   position/torque control, contacts and force-torque sensors.
 
+[Unreleased]: https://github.com/justagist/mujoco_robot/compare/v0.2.0...HEAD
 [0.2.0]: https://github.com/justagist/mujoco_robot/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/justagist/mujoco_robot/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/justagist/mujoco_robot/compare/v0.0.1...v0.1.0

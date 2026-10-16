@@ -62,14 +62,11 @@ def test_set_dof_fields():
 def test_set_geom_friction_scalar_and_vector():
     r = make()
     try:
-        named = [r.geom_id_to_name[g] for g in r.robot_geom_ids if r.geom_id_to_name[g]]
-        if not named:
-            pytest.skip("no named robot geoms on this model")
-        name = named[0]
-        gid = r.geom_name_to_id[name]
-        r.set_geom_friction(name, 1.5)  # scalar -> sliding only
+        gid = r.robot_geom_ids[0]  # Panda's geoms are unnamed, so address it by id
+        assert not r.geom_id_to_name[gid]
+        r.set_geom_friction(gid, 1.5)  # scalar -> sliding only
         assert np.isclose(r.model.geom_friction[gid, 0], 1.5)
-        r.set_geom_friction(name, [0.8, 0.02, 0.001])
+        r.set_geom_friction(np.int32(gid), [0.8, 0.02, 0.001])  # ids from model arrays are numpy
         assert np.allclose(r.model.geom_friction[gid], [0.8, 0.02, 0.001])
     finally:
         r.shutdown()
@@ -133,6 +130,8 @@ def test_dynamics_setters_reject_non_robot_elements():
     try:
         with pytest.raises(ValueError):
             r.set_geom_friction("ground", 1.0)
+        with pytest.raises(ValueError):
+            r.set_geom_friction(r.geom_name_to_id["ground"], 1.0)  # same geom, by id
         with pytest.raises(ValueError):
             r.set_dof_damping("not_a_joint", 1.0)
         with pytest.raises(ValueError):
