@@ -15,7 +15,7 @@ from typing import Sequence
 import numpy as np
 import mujoco
 
-from .mujoco_robot import xyzw_to_wxyz
+from .types import xyzw_to_wxyz
 
 _FREE = int(mujoco.mjtJoint.mjJNT_FREE)
 _HINGE = int(mujoco.mjtJoint.mjJNT_HINGE)
