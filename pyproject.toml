@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mujoco_robot"
-version = "0.1.1"
+version = "0.2.0"
 description = "A general Python interface class for robot simulations using MuJoCo."
 readme = "README.md"
 license = "MIT"
@@ -33,18 +33,20 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
 ]
 dependencies = [
-    "robot-descriptions>=2.0,<3",
     "numpy>=1.24,<3",
     "scipy>=1.14,<2",
     "mujoco>=3.2",
 ]
 
 [project.optional-dependencies]
+# Fetch robot descriptions by name (mujoco_robot.utils.robot_loader_utils). The tests and most
+# examples use it; the core install does NOT require it.
+descriptions = ["robot-descriptions>=2.0,<3"]
 # Optional whole-body / multi-frame IK backend (used by examples/demo_mink_wholebody_ik.py).
 # The core install and the differential_ik helper do NOT require mink.
 ik = ["mink>=1.1"]
-test = ["pytest"]
-dev = ["pytest", "ruff", "build"]
+test = ["pytest", "robot-descriptions>=2.0,<3"]
+dev = ["pytest", "ruff", "build", "robot-descriptions>=2.0,<3"]
 
 [project.urls]
 Homepage = "https://github.com/justagist/mujoco_robot"
@@ -60,6 +62,9 @@ mujoco_robot = ["py.typed"]
 
 [tool.ruff]
 line-length = 100
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

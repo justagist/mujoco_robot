@@ -11,9 +11,10 @@ angle literals. If you add angle literals (euler / joint range), set ``spec.comp
 False`` first so they are treated as radians, matching the radian public API.
 """
 
-from typing import Sequence
+from typing import List, Sequence
 
 import mujoco
+import numpy as np
 
 _FREE = int(mujoco.mjtJoint.mjJNT_FREE)
 _PLANE = int(mujoco.mjtGeom.mjGEOM_PLANE)
@@ -139,6 +140,102 @@ def add_ft_sensors(spec: mujoco.MjSpec, link_names: Sequence[str]):
             sensor.type = stype
             sensor.objtype = mujoco.mjtObj.mjOBJ_SITE
             sensor.objname = site_name
+
+
+def add_position_actuators(
+    spec: mujoco.MjSpec,
+    joint_names: Sequence[str],
+    kp,
+    kv,
+    ctrl_from_joint_range: bool = True,
+    prefix: str = "",
+) -> List[str]:
+    """Add a position servo (``general`` actuator) on each named hinge/slide joint.
+
+    Each actuator applies ``kp * (ctrl - q) - kv * qdot``: ``gaintype=FIXED`` with
+    ``gainprm[0] = kp``, and ``biastype=AFFINE`` with ``biasprm[1] = -kp`` and
+    ``biasprm[2] = -kv``. Use this for descriptions that ship no actuators (most URDFs), so the
+    robot is position-controlled through ``data.ctrl`` instead of a PD loop on
+    ``qfrc_applied``.
+
+    NOTE: ``MjSpec`` actuators default to ``biastype=NONE``. Setting ``biasprm`` without also
+    setting ``biastype=AFFINE`` compiles without complaint but silently yields a pure gain
+    (force ``kp * ctrl``), not a position servo.
+
+    Args:
+        spec (mujoco.MjSpec): The editable model spec.
+        joint_names (Sequence[str]): Joints to actuate, as named in the robot's description.
+        kp (float | Sequence[float]): Position gain(s), scalar or one per joint.
+        kv (float | Sequence[float]): Velocity (damping) gain(s), scalar or one per joint.
+        ctrl_from_joint_range (bool, optional): Limit each actuator's ``ctrlrange`` to its
+            joint's range (unlimited joints stay unlimited). The compiler converts the range, so
+            this is correct whatever the spec's angle unit. Defaults to True.
+        prefix (str, optional): Prepended to each joint name to find it in ``spec``, e.g. the
+            prefix a robot was attached under with :func:`attach_robot`. Defaults to "".
+
+    Returns:
+        List[str]: The new actuator names, ``f"{prefix}{joint}_pos"``, in ``joint_names`` order.
+    """
+    joint_names = list(joint_names)
+    kps = np.broadcast_to(np.asarray(kp, dtype=float), (len(joint_names),))
+    kvs = np.broadcast_to(np.asarray(kv, dtype=float), (len(joint_names),))
+    joints = {j.name: j for j in spec.joints}
+    one_dof = (int(mujoco.mjtJoint.mjJNT_HINGE), int(mujoco.mjtJoint.mjJNT_SLIDE))
+    names = []
+    for name, kp_i, kv_i in zip(joint_names, kps, kvs):
+        full_name = f"{prefix}{name}"
+        joint = joints.get(full_name)
+        if joint is None:
+            raise ValueError(f"No joint named '{full_name}' to add an actuator to.")
+        if int(joint.type) not in one_dof:
+            raise ValueError(f"Joint '{full_name}' is not a hinge or slide joint.")
+        act = spec.add_actuator()
+        act.name = f"{full_name}_pos"
+        act.trntype = mujoco.mjtTrn.mjTRN_JOINT
+        act.target = full_name
+        act.gaintype = mujoco.mjtGain.mjGAIN_FIXED
+        act.biastype = mujoco.mjtBias.mjBIAS_AFFINE
+        act.gainprm[0] = kp_i
+        act.biasprm[1] = -kp_i
+        act.biasprm[2] = -kv_i
+        if ctrl_from_joint_range:
+            # ctrlrange = joint range, converted by the compiler; ignored for unlimited joints.
+            act.inheritrange = 1.0
+        names.append(act.name)
+    return names
+
+
+def attach_robot(
+    world_spec: mujoco.MjSpec,
+    robot_spec: mujoco.MjSpec,
+    prefix: str,
+    pos: Sequence[float] = None,
+    quat_xyzw: Sequence[float] = None,
+):
+    """Attach a loaded robot spec into a world spec, with its base at the given pose.
+
+    The robot's root body (and its actuators, sensors and other elements) is copied under a new
+    frame of the world body, with every name prefixed by ``prefix``. Wrap the result with
+    ``MujocoRobot(model=..., data=..., joint_names=[f"{prefix}{j}" for j in ...])``.
+
+    Args:
+        world_spec (mujoco.MjSpec): The world to attach into (modified in place).
+        robot_spec (mujoco.MjSpec): The robot, e.g. from :func:`load_spec`.
+        prefix (str): Name prefix for every attached element, e.g. ``"arm/"``.
+        pos (Sequence[float], optional): Base position in the world. Defaults to the origin.
+        quat_xyzw (Sequence[float], optional): Base orientation quaternion [x, y, z, w].
+            Defaults to identity.
+
+    Returns:
+        mujoco.MjsBody: The attached root body (in ``world_spec``).
+    """
+    frame = world_spec.worldbody.add_frame()
+    if pos is not None:
+        frame.pos = list(pos)
+    if quat_xyzw is not None:
+        x, y, z, w = (float(v) for v in quat_xyzw)
+        frame.quat = [w, x, y, z]  # MuJoCo order
+    return frame.attach_body(get_root_body(robot_spec), prefix, "")
 
 
 def build_model(

@@ -1,20 +1,40 @@
 """Utils for fetching robot description files (URDF/MJCF) via robot_descriptions.
 
 MuJoCo builds prefer MJCF: use :func:`get_mjcf_from_awesome_robot_descriptions`.
+
+``robot_descriptions`` is an optional dependency (``pip install "mujoco_robot[descriptions]"``).
+It is imported only when one of these helpers (or ``AWESOME_ROBOTS``) is used.
 """
 
-from typing import List
 import logging
 import importlib
-from robot_descriptions._descriptions import DESCRIPTIONS as _AR_DESCRIPTIONS
+
+_INSTALL_HINT = (
+    "robot_descriptions is not installed; install it with "
+    '`pip install "mujoco_robot[descriptions]"`.'
+)
 
 
-AWESOME_ROBOTS: List[str] = list(_AR_DESCRIPTIONS.keys())
-"""List of all available robots from the Awesome Robots List that can be used."""
+def _require_robot_descriptions():
+    """Import robot_descriptions, or raise an ImportError that says how to install it."""
+    try:
+        importlib.import_module("robot_descriptions")
+    except ImportError as e:
+        raise ImportError(_INSTALL_HINT) from e
+
+
+def __getattr__(name: str):
+    # AWESOME_ROBOTS: list of all available robots from the Awesome Robots List that can be
+    # used. Resolved on first access so that importing this module never needs the package.
+    if name == "AWESOME_ROBOTS":
+        _require_robot_descriptions()
+        descriptions = importlib.import_module("robot_descriptions._descriptions").DESCRIPTIONS
+        return list(descriptions.keys())
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def _get_file_from_ard_pkg(description_pkg_name, filetype):
-
+    _require_robot_descriptions()
     try:
         return getattr(
             importlib.import_module(f"robot_descriptions.{description_pkg_name}"),

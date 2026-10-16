@@ -12,7 +12,7 @@ radians. A compiled ``MjModel`` always stores angles in radians regardless of th
 conversion is needed or performed.
 """
 
-from typing import Dict, List, Mapping, Optional, Tuple, TypeAlias
+from typing import Dict, List, Mapping, Optional, Sequence, Tuple, TypeAlias
 from dataclasses import dataclass
 from collections import deque
 import atexit
@@ -173,15 +173,33 @@ class MujocoObject:
 
     Built from an existing ``MjModel``. No physics is performed here; this only reads the model's
     structure (equivalent role to reading a loaded body's joint/link tables).
+
+    By default the whole model is the object: every non-free joint is an actuated joint, every
+    body is a link, and the root is the first child of the world. Passing ``joint_names`` scopes
+    the object to one robot inside a larger world: only those joints are actuated, and the links
+    are the subtree under the root body. Everything else in the model is foreign.
     """
 
-    def __init__(self, model: mujoco.MjModel):
+    def __init__(
+        self,
+        model: mujoco.MjModel,
+        joint_names: Optional[Sequence[str]] = None,
+        root_body: Optional[str] = None,
+    ):
         """Read all addressing/structure information from a compiled model.
 
         Args:
             model (mujoco.MjModel): A compiled MuJoCo model.
+            joint_names (Sequence[str], optional): Scope the object to exactly these 1-dof (hinge
+                or slide) joints, in this order. Defaults to None (the whole model).
+            root_body (str, optional): Name of the robot's root body. Base pose and velocity are
+                read from it, and the base is floating iff it carries a free joint. Defaults to
+                the first child of the world, or, when ``joint_names`` is given, the deepest body
+                that is an ancestor of every scoped joint.
         """
         self.model = model
+        self.is_scoped: bool = joint_names is not None
+        """Whether this object covers only the given ``joint_names`` (not the whole model)."""
 
         obj = mujoco.mjtObj
         self.body_names, self.body_name_to_id, self.body_id_to_name = _id_name_maps(
@@ -203,8 +221,29 @@ class MujocoObject:
             model, obj.mjOBJ_SENSOR, model.nsensor
         )
 
-        # Links are bodies, excluding the world body (id 0).
-        self.link_ids: List[int] = list(range(1, model.nbody))
+        scoped_joint_ids = self._resolve_scoped_joints(joint_names) if self.is_scoped else None
+
+        # Base = root body: the given one, else the common ancestor of the scoped joints, else
+        # the first body whose parent is the world.
+        if root_body is not None:
+            if root_body not in self.body_name_to_id or self.body_name_to_id[root_body] == 0:
+                raise ValueError(f"'{root_body}' is not a body that can be a robot root.")
+            self.base_id: int = self.body_name_to_id[root_body]
+        elif self.is_scoped:
+            self.base_id = self._infer_root_body(scoped_joint_ids)
+        else:
+            self.base_id = next(
+                (i for i in range(1, model.nbody) if int(model.body_parentid[i]) == 0), 1
+            )
+        self.base_name: str = self.body_id_to_name.get(self.base_id, "")
+        self.name: str = self.base_name
+        """Name of the robot (its base/root link name)."""
+
+        # Links are bodies, excluding the world body (id 0). Scoped: the subtree under the root.
+        if self.is_scoped:
+            self.link_ids: List[int] = self._subtree_body_ids(self.base_id)
+        else:
+            self.link_ids = list(range(1, model.nbody))
         self.link_names: List[str] = [self.body_id_to_name[i] for i in self.link_ids]
         self.link_name_to_id: Dict[str, int] = {
             n: i for n, i in zip(self.link_names, self.link_ids) if n
@@ -217,29 +256,92 @@ class MujocoObject:
             g for g in range(model.ngeom) if int(model.geom_bodyid[g]) in link_id_set
         ]
 
-        # Base = root body (first body whose parent is the world).
-        self.base_id: int = next(
-            (i for i in range(1, model.nbody) if int(model.body_parentid[i]) == 0), 1
-        )
-        self.base_name: str = self.body_id_to_name.get(self.base_id, "")
-        self.name: str = self.base_name
-        """Name of the robot (its base/root link name)."""
-
-        # Map each JOINT-transmission actuator to the joint it drives.
+        # Map each joint-transmission actuator to the joint it drives (matched by transmission
+        # target, so actuator names need not match joint names).
+        joint_trn = (int(mujoco.mjtTrn.mjTRN_JOINT), int(mujoco.mjtTrn.mjTRN_JOINTINPARENT))
         self.joint_id_to_actuator_id: Dict[int, int] = {}
+        joint_actuators: Dict[int, List[int]] = {}
         for a in range(model.nu):
-            if int(model.actuator_trntype[a]) == int(mujoco.mjtTrn.mjTRN_JOINT):
-                self.joint_id_to_actuator_id[int(model.actuator_trnid[a, 0])] = a
-        self.has_actuators: bool = model.nu > 0
+            if int(model.actuator_trntype[a]) in joint_trn:
+                jid = int(model.actuator_trnid[a, 0])
+                self.joint_id_to_actuator_id[jid] = a
+                joint_actuators.setdefault(jid, []).append(a)
+        if self.is_scoped:
+            self.robot_actuator_ids: List[int] = sorted(
+                a for j in scoped_joint_ids for a in joint_actuators.get(j, [])
+            )
+            """Ids of the actuators driving this robot's actuated joints."""
+            self.has_actuators: bool = len(self.robot_actuator_ids) > 0
+        else:
+            self.robot_actuator_ids = list(range(model.nu))
+            self.has_actuators = model.nu > 0
 
         # Total mass. Per-body dynamics (mass/inertia/com) are cheap direct lookups on the
         # model's ``body_*`` arrays, so there is no per-link info struct; see get_link_mass.
         self.mass: float = float(sum(model.body_mass[i] for i in self.link_ids))
         """Total mass of this object."""
 
-        self._build_joint_info()
+        self._build_joint_info(scoped_joint_ids)
 
-    def _build_joint_info(self):
+    def _resolve_scoped_joints(self, joint_names: Sequence[str]) -> List[int]:
+        """Validate the scoped joint names and return their ids, in the given order."""
+        one_dof = (int(mujoco.mjtJoint.mjJNT_HINGE), int(mujoco.mjtJoint.mjJNT_SLIDE))
+        joint_names = list(joint_names)
+        if not joint_names:
+            raise ValueError("joint_names must name at least one joint.")
+        if len(set(joint_names)) != len(joint_names):
+            raise ValueError(f"joint_names contains duplicates: {joint_names}")
+        ids = []
+        for name in joint_names:
+            if name not in self.joint_name_to_id:
+                raise ValueError(f"No joint named '{name}' in the model.")
+            jid = self.joint_name_to_id[name]
+            if int(self.model.jnt_type[jid]) not in one_dof:
+                raise ValueError(f"Joint '{name}' is not a hinge or slide joint.")
+            ids.append(jid)
+        return ids
+
+    def _ancestors(self, body_id: int) -> List[int]:
+        """The body and its ancestors, nearest first, ending at the world body (id 0)."""
+        chain = [body_id]
+        while chain[-1] != 0:
+            chain.append(int(self.model.body_parentid[chain[-1]]))
+        return chain
+
+    def _common_ancestor(self, body_ids: List[int]) -> int:
+        """Deepest body that is an ancestor of (or equal to) every body in ``body_ids``."""
+        common = self._ancestors(body_ids[0])
+        for b in body_ids[1:]:
+            ancestors = set(self._ancestors(b))
+            common = [c for c in common if c in ancestors]
+        return common[0]
+
+    def _infer_root_body(self, joint_ids: List[int]) -> int:
+        """Root of a scoped robot: the deepest body that the scoped joints all move relative to.
+
+        That is the common ancestor of the joints' parent bodies (the arm base for a serial
+        chain, the hand for a pair of fingers). If that is the world, fall back to the common
+        ancestor of the joint bodies themselves.
+        """
+        joint_bodies = [int(self.model.jnt_bodyid[j]) for j in joint_ids]
+        root = self._common_ancestor([int(self.model.body_parentid[b]) for b in joint_bodies])
+        if root == 0:
+            root = self._common_ancestor(joint_bodies)
+        if root == 0:
+            raise ValueError(
+                "The given joints share no common body other than the world; pass root_body."
+            )
+        return root
+
+    def _subtree_body_ids(self, root_id: int) -> List[int]:
+        """Ids of ``root_id`` and all of its descendants (MuJoCo orders parents before children)."""
+        subtree = {root_id}
+        for b in range(root_id + 1, self.model.nbody):
+            if int(self.model.body_parentid[b]) in subtree:
+                subtree.add(b)
+        return sorted(subtree)
+
+    def _build_joint_info(self, scoped_joint_ids: Optional[List[int]] = None):
         model = self.model
         free_type = int(mujoco.mjtJoint.mjJNT_FREE)
         hinge_type = int(mujoco.mjtJoint.mjJNT_HINGE)
@@ -282,21 +384,39 @@ class MujocoObject:
                 actuator_id=self.joint_id_to_actuator_id.get(j),
             )
 
-            # The free joint is the floating base, not an actuated joint.
+            # A free joint on the root body is the floating base. Free joints elsewhere belong to
+            # other bodies in the world. Neither is an actuated joint.
             if jtype == free_type:
-                self.free_joint_id = j
+                if int(model.jnt_bodyid[j]) == self.base_id:
+                    self.free_joint_id = j
                 continue
 
+        if scoped_joint_ids is None:
+            scoped_joint_ids = [
+                j for j in range(model.njnt) if int(model.jnt_type[j]) != free_type
+            ]
+        else:
+            subtree = set(self.link_ids)
+            outside = [
+                self.joint_id_to_name[j]
+                for j in scoped_joint_ids
+                if int(model.jnt_bodyid[j]) not in subtree
+            ]
+            if outside:
+                raise ValueError(f"Joints {outside} are not under root body '{self.base_name}'.")
+
+        for j in scoped_joint_ids:
+            info = self.joint_name_to_info[self.joint_id_to_name[j]]
             self.actuated_joint_ids.append(j)
-            self.actuated_joint_names.append(name)
-            self.actuated_joint_lower_limits.append(lower)
-            self.actuated_joint_upper_limits.append(upper)
-            self.actuated_joint_qpos_adrs.append(qadr)
-            self.actuated_joint_dof_adrs.append(dadr)
+            self.actuated_joint_names.append(info.joint_name)
+            self.actuated_joint_lower_limits.append(info.lower_limit)
+            self.actuated_joint_upper_limits.append(info.upper_limit)
+            self.actuated_joint_qpos_adrs.append(info.qpos_adr)
+            self.actuated_joint_dof_adrs.append(info.dof_adr)
 
             # A revolute joint with no limits is a continuous joint.
-            if jtype == hinge_type and not limited:
-                self.continuous_joint_names.append(name)
+            if info.joint_type == hinge_type and not info.limited:
+                self.continuous_joint_names.append(info.joint_name)
                 self.continuous_joint_ids.append(j)
 
         self.num_actuated_joints: int = len(self.actuated_joint_ids)
@@ -359,6 +479,12 @@ class MujocoRobot(MujocoObject):
     plane and light) or wraps an existing ``(model, data)`` pair, and manages the simulation
     lifecycle: stepping, gravity/timestep, an optional background stepping thread, an optional
     passive viewer, and shutdown.
+
+    Wrapping mode (``model`` passed in) is for a robot that lives inside a world owned by someone
+    else. The host steps ``data``; this object only reads state and writes ``ctrl`` /
+    ``qfrc_applied`` for its own joints. Construction changes nothing unless initial positions
+    are given explicitly. Pass ``joint_names`` (and optionally ``root_body``) to scope the robot
+    to one part of the model, leaving every other joint, actuator and body alone.
     """
 
     def __init__(
@@ -369,10 +495,10 @@ class MujocoRobot(MujocoObject):
         data: mujoco.MjData = None,
         ee_names: List[str] = None,
         ee_sites: List[str] = None,
-        run_async: bool = True,
+        run_async: Optional[bool] = None,
         use_fixed_base: bool = True,
         default_joint_positions: List[float] = None,
-        place_on_ground: bool = True,
+        place_on_ground: Optional[bool] = None,
         default_base_position: Vector3D = None,
         default_base_orientation: QuatType = None,
         enable_torque_mode: bool = False,
@@ -382,6 +508,9 @@ class MujocoRobot(MujocoObject):
         smooth_ft: bool = False,
         ft_smoothing_window: int = 10,
         render: bool = False,
+        joint_names: List[str] = None,
+        root_body: str = None,
+        managed_pd: Optional[bool] = None,
     ):
         """Create a robot interface. Does not start the visualiser by default.
 
@@ -389,23 +518,30 @@ class MujocoRobot(MujocoObject):
             mjcf_path (str, optional): Path to an MJCF file to load (preferred).
             urdf_path (str, optional): Path to a URDF file to load (best-effort).
             model (mujoco.MjModel, optional): An already-compiled model to wrap. Takes precedence
-                over the path arguments; no world-building is applied to it.
+                over the path arguments; no world-building is applied to it. Selects wrapping
+                mode, which changes several defaults below.
             data (mujoco.MjData, optional): Existing state to wrap. A fresh ``MjData`` is created
                 if not provided.
             ee_names (List[str], optional): End-effector body names.
             ee_sites (List[str], optional): Optional site names to use as end-effector frames
                 (overrides the body frame for those end-effectors when reading poses/jacobians).
             run_async (bool, optional): Step physics in a background thread. If False, call
-                ``step()`` manually. Defaults to True.
+                ``step()`` manually. Defaults to True when loading from a path and False in
+                wrapping mode.
             use_fixed_base (bool, optional): Fixed (True) or floating (False) base. Only applied
                 when loading from a path. Defaults to True.
             default_joint_positions (List[float], optional): Initial actuated-joint positions
-                (in ``actuated_joint_names`` order). Defaults to zeros.
+                (in ``actuated_joint_names`` order). Applied on construction if given. Defaults
+                to zeros (applied) when loading from a path, and to the current positions (not
+                applied) in wrapping mode.
             place_on_ground (bool, optional): Raise the base until the robot is not penetrating the
-                ground. Defaults to True.
-            default_base_position (Vector3D, optional): Initial base position. Defaults to zeros.
+                ground. Defaults to True when loading from a path and False in wrapping mode.
+            default_base_position (Vector3D, optional): Initial base position. Applied on
+                construction if given. Defaults to zeros (applied) when loading from a path, and
+                to the current base position (not applied) in wrapping mode.
             default_base_orientation (QuatType, optional): Initial base orientation quaternion
-                [x,y,z,w]. Defaults to identity.
+                [x,y,z,w]. Same rules as ``default_base_position``; defaults to identity when
+                loading from a path.
             enable_torque_mode (bool, optional): Start in effort/torque control mode. Defaults to
                 False.
             verbose (bool, optional): Print a robot info summary on construction. Defaults to True.
@@ -419,7 +555,20 @@ class MujocoRobot(MujocoObject):
             ft_smoothing_window (int, optional): Window length used when ``smooth_ft`` is set.
             render (bool, optional): Launch a passive viewer on construction (needs a display).
                 Defaults to False.
+            joint_names (List[str], optional): Scope the robot to exactly these hinge/slide
+                joints, in this order. They become ``actuated_joint_names``; every other joint
+                in the model is foreign and is never written. Defaults to None (every non-free
+                joint in the model).
+            root_body (str, optional): The robot's root body. Base pose and velocity come from
+                it, and the base is floating iff it carries a free joint. Defaults to the first
+                child of the world, or, with ``joint_names``, the common ancestor of the joints.
+            managed_pd (bool, optional): Allow position/velocity commands to joints that have no
+                actuator, by running a PD loop on ``qfrc_applied`` before each step. If False,
+                such commands raise instead. Defaults to True when loading from a path and False
+                in wrapping mode. In wrapping mode the host must call
+                :meth:`apply_managed_control` before each ``mj_step`` for the PD to act.
         """
+        wrapping = model is not None
         if model is None:
             if mjcf_path is None and urdf_path is None:
                 raise ValueError("Provide one of: model, mjcf_path, urdf_path.")
@@ -430,8 +579,18 @@ class MujocoRobot(MujocoObject):
                 load_ground_plane=load_ground_plane,
                 ft_sensor_links=ft_sensor_links,
             )
-        super().__init__(model)
+        if run_async is None:
+            run_async = not wrapping
+        if place_on_ground is None:
+            place_on_ground = not wrapping
+        if managed_pd is None:
+            managed_pd = not wrapping
+
+        super().__init__(model, joint_names=joint_names, root_body=root_body)
         self.data: mujoco.MjData = data if data is not None else mujoco.MjData(self.model)
+        self.managed_pd: bool = managed_pd
+        """Whether commands to joints without an actuator are served by a PD on qfrc_applied."""
+        self._actuated_joint_id_set = frozenset(self.actuated_joint_ids)
 
         self.sync_mode: bool = not run_async
         self._lock = threading.RLock()
@@ -447,13 +606,21 @@ class MujocoRobot(MujocoObject):
         self._managed_targets: Dict[int, Tuple[Optional[float], float]] = {}
         # Cosmetics: geoms whose collision masks were saved when disabled (for restore).
         self._saved_geom_masks: Dict[int, Tuple[int, int]] = {}
+        # Scoped torque mode: own actuators' (forcelimited, forcerange) saved while clamped to 0.
+        self._saved_actuator_limits: Dict[int, Tuple[int, np.ndarray]] = {}
         self.default_position_kp: float = 100.0
         self.default_position_kd: float = 10.0
 
+        base_given = default_base_position is not None or default_base_orientation is not None
+        if wrapping:
+            current_pos, current_wxyz = self._kinematic_body_pose(self.base_id)
+            current_quat = wxyz_to_xyzw(current_wxyz)
+        else:
+            current_pos, current_quat = np.zeros(3), np.array([0.0, 0.0, 0.0, 1.0])
         if default_base_position is None:
-            default_base_position = np.zeros(3)
+            default_base_position = current_pos
         if default_base_orientation is None:
-            default_base_orientation = np.array([0.0, 0.0, 0.0, 1.0])
+            default_base_orientation = current_quat
         self.default_start_pose = [
             np.array(default_base_position, dtype=float),
             np.array(default_base_orientation, dtype=float),
@@ -480,19 +647,28 @@ class MujocoRobot(MujocoObject):
             }
             self.add_post_step_callable({"_ft_smoothing": [self._record_ft, []]})
 
-        if default_joint_positions is not None:
+        joints_given = default_joint_positions is not None
+        if joints_given:
             self.default_joint_positions = np.asarray(default_joint_positions, dtype=float)
+        elif wrapping:
+            self.default_joint_positions = np.array(
+                [self.data.qpos[adr] for adr in self.actuated_joint_qpos_adrs]
+            )
         else:
             self.default_joint_positions = np.zeros(self.num_actuated_joints)
 
-        if self.has_floating_base:
+        # In wrapping mode the world's current state is left exactly as it is unless an initial
+        # base pose or joint configuration was asked for.
+        if (wrapping and base_given) or (not wrapping and self.has_floating_base):
             self.reset_base_pose(self.default_start_pose[0], self.default_start_pose[1])
-        self.reset_joints(self.actuated_joint_ids, self.default_joint_positions)
+        if joints_given or not wrapping:
+            self.reset_joints(self.actuated_joint_ids, self.default_joint_positions)
 
-        # Enter the initial control mode (position mode holds the current configuration).
+        # Enter the initial control mode (position mode holds the current configuration). A
+        # wrapped robot keeps the host's ctrl unless its joints were just reset.
         if self._enable_torque_mode:
             self.set_torque_control_mode()
-        else:
+        elif joints_given or not wrapping:
             self.set_position_control_mode()
 
         if verbose:
@@ -513,6 +689,10 @@ class MujocoRobot(MujocoObject):
 
         Runs the registered pre-step callables, applies control, steps, then runs the post-step
         callables and syncs the viewer.
+
+        Use this only if this robot owns stepping. A wrapped robot inside a host's world should
+        leave stepping to the host (which steps the whole world once per tick); calling this as
+        well would advance the world twice.
         """
         if self.sync_mode:
             self._locked_step()
@@ -521,7 +701,7 @@ class MujocoRobot(MujocoObject):
         """One step with hooks + control, holding the lock so it is safe against the async thread."""
         with self._lock:
             self._run_callables(self._pre_step_callables)
-            self._apply_managed_control()
+            self.apply_managed_control()
             mujoco.mj_step(self.model, self.data)
             self._run_callables(self._post_step_callables)
             if self._viewer is not None:
@@ -596,7 +776,11 @@ class MujocoRobot(MujocoObject):
         return self._viewer
 
     def shutdown(self):
-        """Stop the background thread (if any) and close the viewer (if any)."""
+        """Stop the background thread (if any) and close the viewer (if any).
+
+        Only a viewer opened by :meth:`launch_viewer` is held here, so a host's own viewer is
+        never closed. Registered with ``atexit``.
+        """
         self._stop_async()
         if self._viewer is not None:
             try:
@@ -634,8 +818,7 @@ class MujocoRobot(MujocoObject):
         """Set the positions (and optionally velocities) of the given (1-dof) joints.
 
         Writes ``qpos``/``qvel`` directly and recomputes derived quantities with ``mj_forward``
-        (no dynamics stepping). Assumes 1-dof (hinge/slide) joints, as is the case for actuated
-        joints.
+        (no dynamics stepping). Only this robot's actuated joints may be given.
 
         Args:
             joint_ids (List[int]): Joint ids to set.
@@ -643,6 +826,7 @@ class MujocoRobot(MujocoObject):
             joint_velocities (np.ndarray, optional): Target velocities. Defaults to zeros.
         """
         joint_positions = np.asarray(joint_positions, dtype=float)
+        self._check_own_joints(joint_ids)
         with self._lock:
             for n, jid in enumerate(joint_ids):
                 info = self.joint_name_to_info[self.joint_id_to_name[jid]]
@@ -684,7 +868,8 @@ class MujocoRobot(MujocoObject):
         """Set the base pose (and optionally base velocity for a floating base).
 
         For a floating base this writes the free-joint ``qpos``/``qvel``. For a fixed base it
-        offsets the root body's placement in the model (``body_pos``/``body_quat``). Either way,
+        offsets the root body's placement in the model (``body_pos``/``body_quat``, converted
+        into the parent body's frame when the root is not a child of the world). Either way,
         ``mj_forward`` is called afterwards.
 
         Args:
@@ -714,9 +899,29 @@ class MujocoRobot(MujocoObject):
                     np.zeros(3) if base_angular_velocity is None else base_angular_velocity
                 )
             else:
-                self.model.body_pos[self.base_id] = position
-                self.model.body_quat[self.base_id] = xyzw_to_wxyz(orientation)
+                local_pos, local_quat = position, xyzw_to_wxyz(orientation)
+                parent = int(self.model.body_parentid[self.base_id])
+                if parent != 0:
+                    parent_pos, parent_quat = self._kinematic_body_pose(parent)
+                    inv_pos, inv_quat = np.zeros(3), np.zeros(4)
+                    mujoco.mju_negPose(inv_pos, inv_quat, parent_pos, parent_quat)
+                    local_pos, quat = np.zeros(3), np.zeros(4)
+                    mujoco.mju_mulPose(local_pos, quat, inv_pos, inv_quat, position, local_quat)
+                    local_quat = quat
+                self.model.body_pos[self.base_id] = local_pos
+                self.model.body_quat[self.base_id] = local_quat
             mujoco.mj_forward(self.model, self.data)
+
+    def _kinematic_body_pose(self, body_id: int) -> Tuple[np.ndarray, np.ndarray]:
+        """World pose ``(pos, quat_wxyz)`` of a body at the current ``qpos``, without touching data.
+
+        Runs forward kinematics on the scratch copy, so it is valid even before the host has
+        called ``mj_forward`` on the live data.
+        """
+        scratch = self._get_scratch_data()
+        scratch.qpos[:] = self.data.qpos
+        mujoco.mj_kinematics(self.model, scratch)
+        return np.array(scratch.xpos[body_id]), np.array(scratch.xquat[body_id])
 
     # --- placement ----------------------------------------------------------
 
@@ -725,9 +930,12 @@ class MujocoRobot(MujocoObject):
         return {i for i in range(self.model.ngeom) if int(self.model.geom_type[i]) == plane}
 
     def _touching_ground(self, ground_ids: set) -> bool:
+        """Whether any of the robot's own geoms touches one of ``ground_ids``."""
+        own = set(self.robot_geom_ids)
         for c in range(self.data.ncon):
             con = self.data.contact[c]
-            if con.geom1 in ground_ids or con.geom2 in ground_ids:
+            g1, g2 = int(con.geom1), int(con.geom2)
+            if (g1 in ground_ids and g2 in own) or (g2 in ground_ids and g1 in own):
                 return True
         return False
 
@@ -750,11 +958,12 @@ class MujocoRobot(MujocoObject):
         """Switch to position control: model actuators are active and hold the current pose.
 
         Position commands go to the model's actuators (``data.ctrl``); for any actuated joint
-        without an actuator a PD controller drives ``data.qfrc_applied`` each step.
+        without an actuator a PD controller drives ``data.qfrc_applied`` each step (if
+        ``managed_pd`` is enabled).
         """
         with self._lock:
-            self.model.opt.disableflags &= ~int(mujoco.mjtDisableBit.mjDSBL_ACTUATION)
-            self.data.qfrc_applied[:] = 0.0
+            self._set_own_actuation(True)
+            self._zero_own_qfrc_applied()
             self._managed_targets.clear()
             self._in_torque_mode = False
             for name in self.actuated_joint_names:
@@ -767,37 +976,98 @@ class MujocoRobot(MujocoObject):
 
         The robot will not hold itself up unless torque commands are sent each control cycle.
         Commands are applied via ``data.qfrc_applied``.
+
+        A scoped robot (``joint_names`` given) disables only its own actuators, by clamping
+        their force range to zero, so the rest of the world keeps its actuation. Otherwise the
+        model-wide actuation flag is used.
         """
         with self._lock:
-            self.model.opt.disableflags |= int(mujoco.mjtDisableBit.mjDSBL_ACTUATION)
-            self.data.ctrl[:] = 0.0
-            self.data.qfrc_applied[:] = 0.0
+            self._set_own_actuation(False)
+            self._zero_own_qfrc_applied()
             self._managed_targets.clear()
             self._in_torque_mode = True
+
+    def _set_own_actuation(self, enabled: bool):
+        """Enable or disable the robot's actuators (and zero their ctrl when disabling)."""
+        if not self.is_scoped:
+            flag = int(mujoco.mjtDisableBit.mjDSBL_ACTUATION)
+            if enabled:
+                self.model.opt.disableflags &= ~flag
+            else:
+                self.model.opt.disableflags |= flag
+                self.data.ctrl[:] = 0.0
+            return
+        if enabled:
+            for a, (limited, frc_range) in self._saved_actuator_limits.items():
+                self.model.actuator_forcelimited[a] = limited
+                self.model.actuator_forcerange[a] = frc_range
+            self._saved_actuator_limits.clear()
+            return
+        for a in self.robot_actuator_ids:
+            if a not in self._saved_actuator_limits:
+                self._saved_actuator_limits[a] = (
+                    int(self.model.actuator_forcelimited[a]),
+                    np.array(self.model.actuator_forcerange[a]),
+                )
+            self.model.actuator_forcelimited[a] = 1
+            self.model.actuator_forcerange[a] = 0.0
+            self.data.ctrl[a] = 0.0
+
+    def _zero_own_qfrc_applied(self):
+        """Zero ``qfrc_applied`` on the robot's dofs (all dofs when the robot is the whole model)."""
+        if self.is_scoped:
+            self.data.qfrc_applied[self.actuated_joint_dof_adrs] = 0.0
+        else:
+            self.data.qfrc_applied[:] = 0.0
 
     @property
     def in_torque_mode(self) -> bool:
         """Whether the robot is currently in effort/torque control mode."""
         return self._in_torque_mode
 
-    def _apply_managed_control(self):
-        """Apply PD control (via qfrc_applied) for joints tracked without a model actuator.
+    def _check_own_joints(self, joint_ids):
+        """Raise unless every id is one of this robot's actuated joints (others are never written)."""
+        foreign = [j for j in joint_ids if j not in self._actuated_joint_id_set]
+        if foreign:
+            names = [self.joint_id_to_name.get(int(j), str(j)) for j in foreign]
+            raise ValueError(f"Joints {names} are not actuated joints of this robot.")
 
-        Called under the lock immediately before each ``mj_step``. Does nothing when there are no
-        managed targets (e.g. when every actuated joint has a position actuator).
+    def _own_joint_info(self, name: str) -> MujocoJointInfo:
+        info = self.joint_name_to_info.get(name)
+        if info is None or info.joint_id not in self._actuated_joint_id_set:
+            raise ValueError(f"'{name}' is not an actuated joint of this robot.")
+        return info
+
+    def _set_managed_target(self, info: MujocoJointInfo, q_des: Optional[float], dq_des: float):
+        if not self.managed_pd:
+            raise ValueError(
+                f"Joint '{info.joint_name}' has no usable actuator for this command and managed_pd "
+                "is off. Add an actuator (e.g. model_builder.add_position_actuators) or construct "
+                "with managed_pd=True."
+            )
+        self._managed_targets[info.joint_id] = (q_des, dq_des)
+
+    def apply_managed_control(self):
+        """Apply PD control (via ``qfrc_applied``) for joints tracked without a model actuator.
+
+        Called automatically before each ``mj_step`` by :meth:`step` and the background thread.
+        A wrapped robot with ``managed_pd=True`` needs the host to call it before each of its own
+        ``mj_step`` calls. Does nothing when there are no managed targets (e.g. when every
+        actuated joint has a position actuator). Only the robot's own dofs are written.
         """
-        if not self._managed_targets:
-            return
-        kp, kd = self.default_position_kp, self.default_position_kd
-        for jid, (q_des, dq_des) in self._managed_targets.items():
-            info = self.joint_name_to_info[self.joint_id_to_name[jid]]
-            tau = kd * (dq_des - self.data.qvel[info.dof_adr])
-            if q_des is not None:
-                err = q_des - self.data.qpos[info.qpos_adr]
-                if jid in self.continuous_joint_ids:
-                    err = wrap_angle(err)
-                tau += kp * err
-            self.data.qfrc_applied[info.dof_adr] = tau
+        with self._lock:
+            if not self._managed_targets:
+                return
+            kp, kd = self.default_position_kp, self.default_position_kd
+            for jid, (q_des, dq_des) in self._managed_targets.items():
+                info = self.joint_name_to_info[self.joint_id_to_name[jid]]
+                tau = kd * (dq_des - self.data.qvel[info.dof_adr])
+                if q_des is not None:
+                    err = q_des - self.data.qpos[info.qpos_adr]
+                    if jid in self.continuous_joint_ids:
+                        err = wrap_angle(err)
+                    tau += kp * err
+                self.data.qfrc_applied[info.dof_adr] = tau
 
     def _normalise_cmd(self, cmd, n: int) -> np.ndarray:
         cmd = np.asarray(cmd, dtype=float)
@@ -809,7 +1079,8 @@ class MujocoRobot(MujocoObject):
         """Command target positions for the given actuated joints (position control).
 
         Joints with a position actuator receive the target via ``data.ctrl``; joints without one
-        are driven toward the target by a PD controller on ``data.qfrc_applied`` each step.
+        are driven toward the target by a PD controller on ``data.qfrc_applied`` each step (only
+        if ``managed_pd`` is enabled; otherwise this raises).
 
         Args:
             cmd (np.ndarray): Target joint positions.
@@ -820,21 +1091,22 @@ class MujocoRobot(MujocoObject):
         if actuated_joint_names is None:
             actuated_joint_names = self.actuated_joint_names
         cmd = self._normalise_cmd(cmd, len(actuated_joint_names))
+        infos = [self._own_joint_info(name) for name in actuated_joint_names]
         with self._lock:
-            for i, name in enumerate(actuated_joint_names):
-                info = self.joint_name_to_info[name]
+            for i, info in enumerate(infos):
                 dq_des = float(vels[i]) if vels is not None else 0.0
                 if not self._in_torque_mode and info.actuator_id is not None:
                     self.data.ctrl[info.actuator_id] = cmd[i]
                     self._managed_targets.pop(info.joint_id, None)
                 else:
-                    self._managed_targets[info.joint_id] = (float(cmd[i]), dq_des)
+                    self._set_managed_target(info, float(cmd[i]), dq_des)
 
     def set_joint_velocities(self, cmd: np.ndarray, actuated_joint_names: List[str] = None):
         """Command target velocities for the given actuated joints (velocity control).
 
         Implemented as a damping PD toward the target velocity via ``data.qfrc_applied`` (gain
-        ``default_position_kd``), since MuJoCo models rarely ship velocity actuators.
+        ``default_position_kd``), since MuJoCo models rarely ship velocity actuators. Needs
+        ``managed_pd`` to be enabled.
 
         Args:
             cmd (np.ndarray): Target joint velocities.
@@ -843,10 +1115,10 @@ class MujocoRobot(MujocoObject):
         if actuated_joint_names is None:
             actuated_joint_names = self.actuated_joint_names
         cmd = self._normalise_cmd(cmd, len(actuated_joint_names))
+        infos = [self._own_joint_info(name) for name in actuated_joint_names]
         with self._lock:
-            for i, name in enumerate(actuated_joint_names):
-                info = self.joint_name_to_info[name]
-                self._managed_targets[info.joint_id] = (None, float(cmd[i]))
+            for i, info in enumerate(infos):
+                self._set_managed_target(info, None, float(cmd[i]))
 
     def set_joint_torques(self, cmd: np.ndarray, actuated_joint_names: List[str] = None):
         """Command target torques/efforts for the given actuated joints (effort control).
@@ -860,9 +1132,9 @@ class MujocoRobot(MujocoObject):
         if actuated_joint_names is None:
             actuated_joint_names = self.actuated_joint_names
         cmd = self._normalise_cmd(cmd, len(actuated_joint_names))
+        infos = [self._own_joint_info(name) for name in actuated_joint_names]
         with self._lock:
-            for i, name in enumerate(actuated_joint_names):
-                info = self.joint_name_to_info[name]
+            for i, info in enumerate(infos):
                 self.data.qfrc_applied[info.dof_adr] = cmd[i]
                 self._managed_targets.pop(info.joint_id, None)
 
@@ -943,6 +1215,7 @@ class MujocoRobot(MujocoObject):
         if actuated_joint_names is None:
             actuated_joint_names = self.actuated_joint_names
         joint_ids = self.get_joint_ids(actuated_joint_names)
+        self._check_own_joints(joint_ids)
         if self._in_torque_mode:
             tau_cmd = self.compute_joint_pd_error(joint_ids, q_des=q, dq_des=dq, Kp=Kp, Kd=Kd) + tau
             with self._lock:
@@ -1494,7 +1767,9 @@ class MujocoRobot(MujocoObject):
         getattr(self.model, field)[info.dof_adr : info.dof_adr + info.dof_dim] = value
 
     def _write_body_mass(self, body_name, mass, scale_inertia: bool = True):
-        bid = self._robot_body_id(body_name)
+        self._write_body_mass_by_id(self._robot_body_id(body_name), mass, scale_inertia)
+
+    def _write_body_mass_by_id(self, bid: int, mass, scale_inertia: bool = True):
         old = float(self.model.body_mass[bid])
         self.model.body_mass[bid] = mass
         if scale_inertia and old > 0.0:
@@ -1561,9 +1836,21 @@ class MujocoRobot(MujocoObject):
             mujoco.mj_forward(self.model, self.data)
 
     def set_total_mass(self, total: float):
-        """Rescale the whole model so its total mass equals ``total`` (via ``mj_setTotalmass``)."""
+        """Rescale the robot so its total mass equals ``total``.
+
+        When the robot is the whole model this is ``mj_setTotalmass``. A scoped robot rescales
+        only its own bodies (mass and inertia), leaving the rest of the world unchanged.
+        """
         with self._lock:
-            mujoco.mj_setTotalmass(self.model, total)
+            if self.is_scoped:
+                current = float(sum(self.model.body_mass[b] for b in self.link_ids))
+                if current <= 0.0:
+                    raise ValueError("The robot has no mass to rescale.")
+                ratio = float(total) / current
+                for b in self.link_ids:
+                    self._write_body_mass_by_id(b, self.model.body_mass[b] * ratio)
+            else:
+                mujoco.mj_setTotalmass(self.model, total)
             mujoco.mj_forward(self.model, self.data)
 
     def randomize_dynamics(

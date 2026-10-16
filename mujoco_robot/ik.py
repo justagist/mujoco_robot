@@ -10,6 +10,8 @@ Exported as a helper, not as part of the main object:
     from mujoco_robot.ik import differential_ik
 """
 
+from typing import Sequence
+
 import numpy as np
 import mujoco
 
@@ -20,9 +22,12 @@ _HINGE = int(mujoco.mjtJoint.mjJNT_HINGE)
 _SLIDE = int(mujoco.mjtJoint.mjJNT_SLIDE)
 
 
-def _clamp_to_limits(model: mujoco.MjModel, qpos: np.ndarray):
-    """Clamp limited 1-dof joints in ``qpos`` to their ranges (in place)."""
-    for j in range(model.njnt):
+def _clamp_to_limits(model: mujoco.MjModel, qpos: np.ndarray, joint_ids: Sequence[int] = None):
+    """Clamp limited 1-dof joints in ``qpos`` to their ranges (in place).
+
+    Only ``joint_ids`` are clamped if given; otherwise every joint is.
+    """
+    for j in range(model.njnt) if joint_ids is None else joint_ids:
         if model.jnt_limited[j] and int(model.jnt_type[j]) in (_HINGE, _SLIDE):
             adr = int(model.jnt_qposadr[j])
             lo, hi = model.jnt_range[j]
@@ -52,6 +57,7 @@ def differential_ik(
     max_iters: int = 100,
     damping: float = 1e-2,
     max_step: float = 0.5,
+    joint_names: Sequence[str] = None,
 ) -> np.ndarray:
     """Damped-least-squares inverse kinematics for a single site (fixed-base robots).
 
@@ -72,14 +78,30 @@ def differential_ik(
         max_iters (int): Maximum iterations.
         damping (float): Damped-least-squares damping factor.
         max_step (float): Maximum L2 norm of a per-iteration joint step (radians).
+        joint_names (Sequence[str], optional): Solve over only these hinge/slide joints (e.g. a
+            scoped robot's ``actuated_joint_names``); every other joint is held where it is.
+            Defaults to None (every joint in the model).
 
     Returns:
         np.ndarray: Actuated-joint positions in MujocoRobot's joint order (free base excluded),
             ready for ``robot.reset_actuated_joint_positions`` / ``robot.set_joint_positions``.
+            With ``joint_names``, the positions of exactly those joints, in that order.
     """
     site_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, site_name)
     if site_id < 0:
         raise ValueError(f"No site named '{site_name}'.")
+
+    joint_ids = cols = None
+    if joint_names is not None:
+        joint_ids = []
+        for name in joint_names:
+            jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, name)
+            if jid < 0:
+                raise ValueError(f"No joint named '{name}'.")
+            if int(model.jnt_type[jid]) not in (_HINGE, _SLIDE):
+                raise ValueError(f"Joint '{name}' is not a hinge or slide joint.")
+            joint_ids.append(jid)
+        cols = [int(model.jnt_dofadr[j]) for j in joint_ids]
 
     # Work on a copy so the live sim is untouched.
     scratch = mujoco.MjData(model)
@@ -113,6 +135,8 @@ def differential_ik(
 
         mujoco.mj_jacSite(model, scratch, jacp, jacr, site_id)
         jac = np.vstack([jacp, jacr]) if track_rot else jacp
+        if cols is not None:
+            jac = jac[:, cols]
         e = err if track_rot else err[:3]
 
         jjt = jac @ jac.T
@@ -121,8 +145,14 @@ def differential_ik(
         if norm > max_step:
             dq = dq * (max_step / norm)
 
+        if cols is not None:
+            dq_full = np.zeros(model.nv)
+            dq_full[cols] = dq
+            dq = dq_full
         mujoco.mj_integratePos(model, scratch.qpos, dq, 1.0)
-        _clamp_to_limits(model, scratch.qpos)
+        _clamp_to_limits(model, scratch.qpos, joint_ids)
         mujoco.mj_forward(model, scratch)
 
+    if joint_ids is not None:
+        return np.array([float(scratch.qpos[int(model.jnt_qposadr[j])]) for j in joint_ids])
     return _actuated_qpos(model, scratch)
