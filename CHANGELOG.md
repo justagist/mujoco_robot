@@ -8,6 +8,10 @@ existing code.
 
 ## [0.3.1] - 2026-11-19
 
+### Added
+
+- Support for Python 3.13 and 3.14.
+
 ### Fixed
 
 - `set_actuated_joint_commands` and `compute_joint_pd_error` accept scalar position targets on
@@ -16,6 +20,12 @@ existing code.
 - `get_gravity_compensation_torques()` returns only the gravity term, as documented. Before, the
   default mode also cancelled joint springs and constraint forces (joint limits, contacts), so
   the values change for models that have them.
+- Robots on a moved mocap mount: `get_jacobian` with `joint_angles`,
+  `get_gravity_compensation_torques()`, `reset_base_pose` (fixed base) and `differential_ik` use
+  the live mocap pose. Before, they used the default mount pose from the model.
+- `get_jacobian` with `joint_angles`, `get_gravity_compensation_torques()` and `differential_ik`
+  do not run global MuJoCo callbacks (for example `mjcb_control`). Before, a host that called them
+  from its control callback could recurse without end.
 
 ## [0.3.0] - 2026-10-16
 
