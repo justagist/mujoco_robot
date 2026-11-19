@@ -41,8 +41,8 @@ from mujoco_robot.utils.robot_loader_utils import get_mjcf_from_awesome_robot_de
 robot = MujocoRobot(
     mjcf_path=get_mjcf_from_awesome_robot_descriptions("panda_mj_description"),
     ee_names=["hand"],
-    run_async=False,   # step manually
-    render=True,       # launch the passive viewer (needs a display)
+    run_async=False,  # step manually
+    render=True,  # launch the passive viewer (needs a display)
 )
 robot.set_position_control_mode()
 
@@ -60,9 +60,13 @@ stepped by its host (other actuated joints, other free bodies, the host's own pr
 scope `MujocoRobot` to the robot's joints:
 
 ```python
-robot = MujocoRobot(model=sim.model, data=sim.data,
-                    joint_names=[f"arm/{j}" for j in AUBO_JOINTS],
-                    ee_sites=["arm/tcp"], run_async=False)
+robot = MujocoRobot(
+    model=sim.model,
+    data=sim.data,
+    joint_names=[f"arm/{j}" for j in AUBO_JOINTS],
+    ee_sites=["arm/tcp"],
+    run_async=False,
+)
 # host steps: sim.step(); robot only reads and writes ctrl / qfrc_applied for its joints
 ```
 

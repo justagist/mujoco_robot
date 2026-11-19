@@ -35,8 +35,6 @@ def test_joint_accelerations_shape():
 
 
 def test_gravity_compensation_modes():
-    # A within-limits config, so no joint-limit constraint force is active (which mj_inverse would
-    # otherwise legitimately include, making the two modes disagree even at rest).
     r = make(default_joint_positions=[0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785, 0.02, 0.02])
     try:
         pure = r.get_gravity_compensation_torques()
@@ -53,6 +51,46 @@ def test_gravity_compensation_modes():
         assert not np.allclose(moving, pure_gravity)
     finally:
         r.shutdown()
+
+
+def test_gravity_compensation_ignores_springs():
+    """A joint spring must not change the gravity term, and the live state stays untouched."""
+
+    def torques(stiffness):
+        xml = f"""<mujoco><worldbody><body pos="0 0 1">
+          <joint name="j" type="hinge" axis="0 1 0" stiffness="{stiffness}" springref="30"/>
+          <geom type="capsule" fromto="0 0 0 .5 0 0" size=".02" mass="1"/>
+        </body></worldbody></mujoco>"""
+        r = MujocoRobot(model=mujoco.MjModel.from_xml_string(xml), verbose=False)
+        try:
+            r.data.qvel[:] = 0.7
+            mujoco.mj_forward(r.model, r.data)
+            before = (r.data.qpos.copy(), r.data.qvel.copy(), r.data.qfrc_bias.copy())
+            tau = r.get_gravity_compensation_torques()
+            for a, b in zip(before, (r.data.qpos, r.data.qvel, r.data.qfrc_bias)):
+                np.testing.assert_array_equal(a, b)
+            return tau
+        finally:
+            r.shutdown()
+
+    no_spring = torques(0)
+    np.testing.assert_allclose(no_spring, [-9.81 * 0.25], rtol=1e-6)  # m * g * lever arm
+    np.testing.assert_allclose(torques(100), no_spring)
+
+
+def test_gravity_compensation_runs_no_callbacks():
+    """A gravity query must not run global MuJoCo callbacks (a control callback could recurse)."""
+    calls = []
+    r = make()
+    try:
+        mujoco.set_mjcb_control(lambda m, d: calls.append("control"))
+        mujoco.set_mjcb_passive(lambda m, d: calls.append("passive"))
+        r.get_gravity_compensation_torques()
+    finally:
+        mujoco.set_mjcb_control(None)
+        mujoco.set_mjcb_passive(None)
+        r.shutdown()
+    assert calls == []
 
 
 def test_joint_states_shapes_and_values():
@@ -237,8 +275,11 @@ def test_frame_handle_for_any_frame_methods():
         with pytest.raises(KeyError):
             r.frame("not_a_frame")
         # Handles this robot would not resolve (wrong kind, id or name) are rejected.
-        for bad in (Frame("link", tcp.id, "tcp"), Frame("site", tcp.id + 1, "tcp"),
-                    Frame("link", hand.id, "not_a_frame")):
+        for bad in (
+            Frame("link", tcp.id, "tcp"),
+            Frame("site", tcp.id + 1, "tcp"),
+            Frame("link", hand.id, "not_a_frame"),
+        ):
             with pytest.raises(ValueError):
                 r.get_jacobian(bad)
     finally:

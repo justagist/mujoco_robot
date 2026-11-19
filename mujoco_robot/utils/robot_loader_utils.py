@@ -75,9 +75,7 @@ def get_urdf_from_awesome_robot_descriptions(
     Returns:
         str: Path to the robot's urdf file.
     """
-    return _get_file_from_ard_pkg(
-        description_pkg_name=robot_description_pkg_name, filetype="URDF"
-    )
+    return _get_file_from_ard_pkg(description_pkg_name=robot_description_pkg_name, filetype="URDF")
 
 
 def get_mjcf_from_awesome_robot_descriptions(
@@ -101,6 +99,4 @@ def get_mjcf_from_awesome_robot_descriptions(
     Returns:
         str: Path to the robot's MJCF file.
     """
-    return _get_file_from_ard_pkg(
-        description_pkg_name=robot_description_pkg_name, filetype="MJCF"
-    )
+    return _get_file_from_ard_pkg(description_pkg_name=robot_description_pkg_name, filetype="MJCF")

@@ -6,6 +6,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Entries tagged **[BREAKING]** can change the behaviour of
 existing code.
 
+## [0.3.1] - 2026-11-19
+
+### Fixed
+
+- `set_actuated_joint_commands` and `compute_joint_pd_error` accept scalar position targets on
+  robots with continuous joints. Before, these calls raised `TypeError` in torque mode, also for
+  the default `q=0`.
+- `get_gravity_compensation_torques()` returns only the gravity term, as documented. Before, the
+  default mode also cancelled joint springs and constraint forces (joint limits, contacts), so
+  the values change for models that have them.
+
 ## [0.3.0] - 2026-10-16
 
 ### Added
@@ -78,6 +89,7 @@ existing code.
 - First release: `MujocoRobot` and `MujocoObject` with loading, stepping, state getters,
   position/torque control, contacts and force-torque sensors.
 
+[0.3.1]: https://github.com/justagist/mujoco_robot/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/justagist/mujoco_robot/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/justagist/mujoco_robot/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/justagist/mujoco_robot/compare/v0.1.0...v0.1.1

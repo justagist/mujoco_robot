@@ -752,6 +752,7 @@ class MujocoRobot(MujocoObject):
         q, dq, _ = self.get_joint_states(joint_ids)
         p_term = np.zeros_like(q)
         if q_des is not None:
+            q_des = self._normalise_cmd(q_des, len(joint_ids))
             p_term = Kp * (q_des - q)
             if self.has_continuous_joints:
                 for n, jid in enumerate(joint_ids):
@@ -838,8 +839,7 @@ class MujocoRobot(MujocoObject):
                 q[i] = wrap_angle(pos) if info.joint_id in self.continuous_joint_ids else pos
                 v[i] = self.data.qvel[info.dof_adr]
                 tau[i] = (
-                    self.data.qfrc_actuator[info.dof_adr]
-                    + self.data.qfrc_applied[info.dof_adr]
+                    self.data.qfrc_actuator[info.dof_adr] + self.data.qfrc_applied[info.dof_adr]
                 )
         return q, v, tau
 
@@ -1024,8 +1024,9 @@ class MujocoRobot(MujocoObject):
 
         - ``include_coriolis=True``: returns ``data.qfrc_bias`` at the current velocity directly.
         - ``include_coriolis=False`` (default, "hold against gravity"): the pure gravity term,
-          computed via inverse dynamics on a scratch copy at zero velocity and acceleration
-          (``mj_inverse`` -> ``qfrc_inverse``). The live simulation state is not mutated.
+          computed with ``mj_rne`` on a scratch copy at zero velocity. Passive (spring) and
+          constraint forces are excluded. The live simulation state is not mutated, and no
+          global MuJoCo callback (``mjcb_control``, ``mjcb_passive``) runs.
 
         Returns:
             np.ndarray: Torque per actuated joint (a useful feedforward term for torque/impedance
@@ -1038,12 +1039,13 @@ class MujocoRobot(MujocoObject):
                 scratch = self._get_scratch_data()
                 scratch.qpos[:] = self.data.qpos
                 scratch.qvel[:] = 0.0
-                scratch.qacc[:] = 0.0
-                mujoco.mj_inverse(self.model, scratch)
-                bias = np.array(scratch.qfrc_inverse)
-        return np.array(
-            [bias[adr] for adr in self.actuated_joint_dof_adrs]
-        )
+                # Only the stages mj_rne reads; mj_comVel clears cvel left by other scratch users.
+                mujoco.mj_kinematics(self.model, scratch)
+                mujoco.mj_comPos(self.model, scratch)
+                mujoco.mj_comVel(self.model, scratch)
+                bias = np.zeros(self.model.nv)
+                mujoco.mj_rne(self.model, scratch, 0, bias)
+        return np.array([bias[adr] for adr in self.actuated_joint_dof_adrs])
 
     # --- state bundle -------------------------------------------------------
 
@@ -1227,8 +1229,10 @@ class MujocoRobot(MujocoObject):
         Returns:
             Tuple[Vector3D, Vector3D]: (force, torque).
         """
-        link = self._ft_link_name(sensor_name) if sensor_name is not None else (
-            self.ft_sensor_links[0] if self.ft_sensor_links else None
+        link = (
+            self._ft_link_name(sensor_name)
+            if sensor_name is not None
+            else (self.ft_sensor_links[0] if self.ft_sensor_links else None)
         )
         if link is None or not self.has_ft_sensor(link):
             raise ValueError(

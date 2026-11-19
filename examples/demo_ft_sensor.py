@@ -115,8 +115,8 @@ def main(render: bool = True, duration: float = None):
 
             wrench = robot.get_link_ft_measurement("hand")
             if render:
-                force_world = Rotation.from_quat(robot.get_site_pose(site_id)[1]).as_matrix().dot(
-                    wrench[:3]
+                force_world = (
+                    Rotation.from_quat(robot.get_site_pose(site_id)[1]).as_matrix().dot(wrench[:3])
                 )
                 _draw_force_arrow(robot, site_id, force_world)
 
