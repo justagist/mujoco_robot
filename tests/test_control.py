@@ -115,3 +115,35 @@ def test_positions_delta_updates_ctrl():
         assert np.allclose(ctrl, before + delta, atol=1e-6)
     finally:
         r.shutdown()
+
+
+def test_set_actuated_joint_commands_scalar_targets_with_continuous_joint():
+    """Scalar q targets broadcast; the continuous joint uses the wrapped error."""
+    xml = """<mujoco><worldbody><body name="b"><geom size=".1"/>
+      <body name="l1"><joint name="cont" type="hinge"/><geom size=".05" pos=".1 0 0"/>
+        <body name="l2"><joint name="lim" type="hinge" limited="true" range="-1 1"/>
+          <geom size=".05" pos=".1 0 0"/></body>
+      </body></body></worldbody></mujoco>"""
+    model = mujoco.MjModel.from_xml_string(xml)
+    data = mujoco.MjData(model)
+    data.qpos[:] = [3.0, 0.1]
+    r = MujocoRobot(model=model, data=data, enable_torque_mode=True, verbose=False)
+    try:
+        assert r.continuous_joint_ids == [r.joint_name_to_info["cont"].joint_id]
+
+        def applied():
+            return np.array(
+                [r.data.qfrc_applied[r.joint_name_to_info[n].dof_adr] for n in ("cont", "lim")]
+            )
+
+        r.set_actuated_joint_commands(tau=2.5)
+        np.testing.assert_allclose(applied(), [2.5, 2.5])
+
+        wrapped = -6.0 + 2 * np.pi  # wrap(-3.0 - 3.0)
+        r.set_actuated_joint_commands(q=-3.0, Kp=10.0)
+        np.testing.assert_allclose(applied(), [10.0 * wrapped, 10.0 * (-3.0 - 0.1)])
+
+        r.set_actuated_joint_commands(q=np.array([-3.0, 0.5]), Kp=np.array([10.0, 20.0]))
+        np.testing.assert_allclose(applied(), [10.0 * wrapped, 20.0 * (0.5 - 0.1)])
+    finally:
+        r.shutdown()

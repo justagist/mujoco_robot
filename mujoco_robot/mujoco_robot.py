@@ -752,6 +752,7 @@ class MujocoRobot(MujocoObject):
         q, dq, _ = self.get_joint_states(joint_ids)
         p_term = np.zeros_like(q)
         if q_des is not None:
+            q_des = self._normalise_cmd(q_des, len(joint_ids))
             p_term = Kp * (q_des - q)
             if self.has_continuous_joints:
                 for n, jid in enumerate(joint_ids):
