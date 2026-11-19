@@ -109,9 +109,7 @@ def test_positions_delta_updates_ctrl():
         before = r.get_actuated_joint_positions(ARM)
         delta = np.full(7, 0.1)
         r.set_joint_positions_delta(delta, actuated_joint_names=ARM)
-        ctrl = np.array(
-            [r.data.ctrl[r.joint_name_to_info[n].actuator_id] for n in ARM]
-        )
+        ctrl = np.array([r.data.ctrl[r.joint_name_to_info[n].actuator_id] for n in ARM])
         assert np.allclose(ctrl, before + delta, atol=1e-6)
     finally:
         r.shutdown()

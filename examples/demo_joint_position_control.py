@@ -59,8 +59,7 @@ def main(render: bool = True, duration: float = None):
                 ee_pos = robot.get_link_pose(robot.ee_ids[0])[0]
                 err = np.linalg.norm(target - robot.get_actuated_joint_positions(ARM))
                 print(
-                    f"t={t:5.1f}s | ee_pos={np.round(ee_pos, 3)} "
-                    f"| joint tracking err={err:.4f} rad"
+                    f"t={t:5.1f}s | ee_pos={np.round(ee_pos, 3)} | joint tracking err={err:.4f} rad"
                 )
                 last_log = now
             time.sleep(dt)

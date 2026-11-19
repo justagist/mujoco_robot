@@ -37,7 +37,9 @@ def main(render: bool = True, duration: float = None):
     try:
         import mink
     except ImportError:
-        print('This demo needs mink. Install the optional backend with:  pip install "mujoco_robot[ik]"')
+        print(
+            'This demo needs mink. Install the optional backend with:  pip install "mujoco_robot[ik]"'
+        )
         return
 
     robot = MujocoRobot(
@@ -55,7 +57,9 @@ def main(render: bool = True, duration: float = None):
     config.update_from_keyframe("home")  # a standing pose
     _apply_config(robot, config.q)
 
-    trunk_task = mink.FrameTask("trunk", "body", position_cost=1.0, orientation_cost=1.0, lm_damping=1.0)
+    trunk_task = mink.FrameTask(
+        "trunk", "body", position_cost=1.0, orientation_cost=1.0, lm_damping=1.0
+    )
     foot_tasks = [
         mink.FrameTask(foot, "site", position_cost=1.0, orientation_cost=0.0, lm_damping=1.0)
         for foot in FEET
@@ -78,7 +82,9 @@ def main(render: bool = True, duration: float = None):
             return robot.is_viewer_running()
         return duration is None or elapsed < duration
 
-    print("\nGo1 squatting: trunk tracks a bobbing target while the feet stay planted. Ctrl+C to exit.\n")
+    print(
+        "\nGo1 squatting: trunk tracks a bobbing target while the feet stay planted. Ctrl+C to exit.\n"
+    )
     start = time.time()
     last_log = 0.0
     try:
@@ -98,10 +104,14 @@ def main(render: bool = True, duration: float = None):
             if now - last_log > 0.5:
                 trunk_z = config.get_transform_frame_to_world("trunk", "body").translation()[2]
                 drift = max(
-                    np.linalg.norm(config.get_transform_frame_to_world(f, "site").translation() - foot0[f])
+                    np.linalg.norm(
+                        config.get_transform_frame_to_world(f, "site").translation() - foot0[f]
+                    )
                     for f in FEET
                 )
-                print(f"t={t:4.1f}s | trunk_z={trunk_z:.3f} m | max foot drift={drift * 1e3:.2f} mm")
+                print(
+                    f"t={t:4.1f}s | trunk_z={trunk_z:.3f} m | max foot drift={drift * 1e3:.2f} mm"
+                )
                 last_log = now
             time.sleep(dt)
     except KeyboardInterrupt:

@@ -839,8 +839,7 @@ class MujocoRobot(MujocoObject):
                 q[i] = wrap_angle(pos) if info.joint_id in self.continuous_joint_ids else pos
                 v[i] = self.data.qvel[info.dof_adr]
                 tau[i] = (
-                    self.data.qfrc_actuator[info.dof_adr]
-                    + self.data.qfrc_applied[info.dof_adr]
+                    self.data.qfrc_actuator[info.dof_adr] + self.data.qfrc_applied[info.dof_adr]
                 )
         return q, v, tau
 
@@ -1041,9 +1040,7 @@ class MujocoRobot(MujocoObject):
                 scratch.qvel[:] = 0.0
                 mujoco.mj_forward(self.model, scratch)
                 bias = np.array(scratch.qfrc_bias)
-        return np.array(
-            [bias[adr] for adr in self.actuated_joint_dof_adrs]
-        )
+        return np.array([bias[adr] for adr in self.actuated_joint_dof_adrs])
 
     # --- state bundle -------------------------------------------------------
 
@@ -1227,8 +1224,10 @@ class MujocoRobot(MujocoObject):
         Returns:
             Tuple[Vector3D, Vector3D]: (force, torque).
         """
-        link = self._ft_link_name(sensor_name) if sensor_name is not None else (
-            self.ft_sensor_links[0] if self.ft_sensor_links else None
+        link = (
+            self._ft_link_name(sensor_name)
+            if sensor_name is not None
+            else (self.ft_sensor_links[0] if self.ft_sensor_links else None)
         )
         if link is None or not self.has_ft_sensor(link):
             raise ValueError(

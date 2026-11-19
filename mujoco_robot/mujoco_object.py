@@ -265,9 +265,7 @@ class MujocoObject:
                 continue
 
         if scoped_joint_ids is None:
-            scoped_joint_ids = [
-                j for j in range(model.njnt) if int(model.jnt_type[j]) != free_type
-            ]
+            scoped_joint_ids = [j for j in range(model.njnt) if int(model.jnt_type[j]) != free_type]
         else:
             subtree = set(self.link_ids)
             outside = [

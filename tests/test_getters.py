@@ -260,8 +260,11 @@ def test_frame_handle_for_any_frame_methods():
         with pytest.raises(KeyError):
             r.frame("not_a_frame")
         # Handles this robot would not resolve (wrong kind, id or name) are rejected.
-        for bad in (Frame("link", tcp.id, "tcp"), Frame("site", tcp.id + 1, "tcp"),
-                    Frame("link", hand.id, "not_a_frame")):
+        for bad in (
+            Frame("link", tcp.id, "tcp"),
+            Frame("site", tcp.id + 1, "tcp"),
+            Frame("link", hand.id, "not_a_frame"),
+        ):
             with pytest.raises(ValueError):
                 r.get_jacobian(bad)
     finally:
