@@ -78,6 +78,21 @@ def test_gravity_compensation_ignores_springs():
     np.testing.assert_allclose(torques(100), no_spring)
 
 
+def test_gravity_compensation_runs_no_callbacks():
+    """A gravity query must not run global MuJoCo callbacks (a control callback could recurse)."""
+    calls = []
+    r = make()
+    try:
+        mujoco.set_mjcb_control(lambda m, d: calls.append("control"))
+        mujoco.set_mjcb_passive(lambda m, d: calls.append("passive"))
+        r.get_gravity_compensation_torques()
+    finally:
+        mujoco.set_mjcb_control(None)
+        mujoco.set_mjcb_passive(None)
+        r.shutdown()
+    assert calls == []
+
+
 def test_joint_states_shapes_and_values():
     q0 = np.linspace(-0.4, 0.4, 9)
     r = make(default_joint_positions=q0)

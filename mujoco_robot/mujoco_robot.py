@@ -1024,8 +1024,9 @@ class MujocoRobot(MujocoObject):
 
         - ``include_coriolis=True``: returns ``data.qfrc_bias`` at the current velocity directly.
         - ``include_coriolis=False`` (default, "hold against gravity"): the pure gravity term,
-          ``qfrc_bias`` of a scratch copy at zero velocity. Passive (spring) and constraint
-          forces are excluded. The live simulation state is not mutated.
+          computed with ``mj_rne`` on a scratch copy at zero velocity. Passive (spring) and
+          constraint forces are excluded. The live simulation state is not mutated, and no
+          global MuJoCo callback (``mjcb_control``, ``mjcb_passive``) runs.
 
         Returns:
             np.ndarray: Torque per actuated joint (a useful feedforward term for torque/impedance
@@ -1038,8 +1039,12 @@ class MujocoRobot(MujocoObject):
                 scratch = self._get_scratch_data()
                 scratch.qpos[:] = self.data.qpos
                 scratch.qvel[:] = 0.0
-                mujoco.mj_forward(self.model, scratch)
-                bias = np.array(scratch.qfrc_bias)
+                # Only the stages mj_rne reads; mj_comVel clears cvel left by other scratch users.
+                mujoco.mj_kinematics(self.model, scratch)
+                mujoco.mj_comPos(self.model, scratch)
+                mujoco.mj_comVel(self.model, scratch)
+                bias = np.zeros(self.model.nv)
+                mujoco.mj_rne(self.model, scratch, 0, bias)
         return np.array([bias[adr] for adr in self.actuated_joint_dof_adrs])
 
     # --- state bundle -------------------------------------------------------
