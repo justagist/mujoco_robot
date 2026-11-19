@@ -78,16 +78,27 @@ def test_does_not_mutate_live_data():
         r.shutdown()
 
 
-def test_uses_live_mocap_mount_pose():
-    """A target at the current site pose needs no motion, also when a mocap mount has moved."""
+def test_reaches_target_on_moved_mocap_mount():
+    """The solution, checked with FK in the live mount pose, places the site at the target."""
     model = mujoco.MjModel.from_xml_string(MOCAP_MOUNT_XML)
     data = mujoco.MjData(model)
     data.qpos[:] = [0.3, -0.6]
     data.mocap_pos[0] = [0.2, -0.1, 1.3]
     data.mocap_quat[0] = [np.cos(0.4), np.sin(0.4), 0.0, 0.0]  # 0.8 rad about x
     mujoco.mj_forward(model, data)
-    q = differential_ik(model, data, "tip", data.site_xpos[0].copy())
-    np.testing.assert_allclose(q, [0.3, -0.6])
+
+    # A reachable target: the site position of another configuration on the same mount.
+    goal = mujoco.MjData(model)
+    goal.qpos[:] = [0.9, -0.3]
+    goal.mocap_pos[:] = data.mocap_pos
+    goal.mocap_quat[:] = data.mocap_quat
+    mujoco.mj_kinematics(model, goal)
+    target = goal.site_xpos[0].copy()
+    assert np.linalg.norm(target - data.site_xpos[0]) > 0.05
+
+    data.qpos[:] = differential_ik(model, data, "tip", target)
+    mujoco.mj_kinematics(model, data)
+    assert np.linalg.norm(data.site_xpos[0] - target) < 1e-3
 
 
 def test_runs_no_callbacks():

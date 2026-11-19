@@ -97,11 +97,12 @@ def test_scratch_queries_follow_moved_mocap_mount():
         r.data.mocap_quat[0] = [np.cos(0.4), np.sin(0.4), 0.0, 0.0]  # 0.8 rad about x
         mujoco.mj_forward(r.model, r.data)
         np.testing.assert_allclose(r.get_gravity_compensation_torques(), r.data.qfrc_bias)
-        np.testing.assert_allclose(
-            r.get_jacobian("tip", joint_angles=r.get_actuated_joint_positions()),
-            r.get_jacobian("tip"),
-            atol=1e-12,
-        )
+        q_other = np.array([0.5, -0.9])
+        jac = r.get_jacobian("tip", joint_angles=q_other)
+        assert np.abs(jac).max() > 0.1
+        r.data.qpos[:] = q_other
+        mujoco.mj_forward(r.model, r.data)
+        np.testing.assert_allclose(jac, r.get_jacobian("tip"), atol=1e-12)
     finally:
         r.shutdown()
 
