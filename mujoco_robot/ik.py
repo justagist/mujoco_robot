@@ -106,6 +106,8 @@ def differential_ik(
     # Work on a copy so the live sim is untouched.
     scratch = mujoco.MjData(model)
     scratch.qpos[:] = data.qpos
+    scratch.mocap_pos[:] = data.mocap_pos
+    scratch.mocap_quat[:] = data.mocap_quat
     mujoco.mj_forward(model, scratch)
 
     target_pos = np.asarray(target_pos, dtype=float)
