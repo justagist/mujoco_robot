@@ -490,7 +490,6 @@ class MujocoRobot(MujocoObject):
         called ``mj_forward`` on the live data.
         """
         scratch = self._get_scratch_data()
-        scratch.qpos[:] = self.data.qpos
         mujoco.mj_kinematics(self.model, scratch)
         return np.array(scratch.xpos[body_id]), np.array(scratch.xquat[body_id])
 
@@ -806,10 +805,17 @@ class MujocoRobot(MujocoObject):
     # --- scratch data (for off-simulation queries) -------------------------
 
     def _get_scratch_data(self) -> mujoco.MjData:
-        """A reusable ``MjData`` for queries that must not disturb the live state."""
+        """A reusable ``MjData`` for queries that must not disturb the live state.
+
+        It is returned with the live ``qpos`` and mocap pose, the inputs that set the kinematics.
+        """
         if getattr(self, "_scratch_data", None) is None:
             self._scratch_data = mujoco.MjData(self.model)
-        return self._scratch_data
+        scratch = self._scratch_data
+        scratch.qpos[:] = self.data.qpos
+        scratch.mocap_pos[:] = self.data.mocap_pos
+        scratch.mocap_quat[:] = self.data.mocap_quat
+        return scratch
 
     # --- joint state --------------------------------------------------------
 
@@ -998,7 +1004,7 @@ class MujocoRobot(MujocoObject):
             ee_link_name (str | Frame): Link (body) or site to compute the Jacobian for.
             joint_angles (np.ndarray, optional): Actuated-joint configuration to evaluate at.
                 Defaults to None (use the current configuration). Evaluated on a scratch copy so
-                the live state is not disturbed.
+                the live state is not disturbed and no global MuJoCo callback runs.
 
         Returns:
             np.ndarray: 6xN Jacobian matrix.
@@ -1009,9 +1015,10 @@ class MujocoRobot(MujocoObject):
                 return self._jacobian_from_data(self.data, frame)
         with self._lock:
             scratch = self._get_scratch_data()
-            scratch.qpos[:] = self.data.qpos
             scratch.qpos[self.actuated_joint_qpos_adrs] = joint_angles
-            mujoco.mj_forward(self.model, scratch)
+            # Only the stages the Jacobian reads: mj_forward would run the global callbacks.
+            mujoco.mj_kinematics(self.model, scratch)
+            mujoco.mj_comPos(self.model, scratch)
             return self._jacobian_from_data(scratch, frame)
 
     # --- dynamics -----------------------------------------------------------
@@ -1037,7 +1044,6 @@ class MujocoRobot(MujocoObject):
                 bias = np.array(self.data.qfrc_bias)
             else:
                 scratch = self._get_scratch_data()
-                scratch.qpos[:] = self.data.qpos
                 scratch.qvel[:] = 0.0
                 # Only the stages mj_rne reads; mj_comVel clears cvel left by other scratch users.
                 mujoco.mj_kinematics(self.model, scratch)

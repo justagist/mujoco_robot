@@ -78,14 +78,44 @@ def test_gravity_compensation_ignores_springs():
     np.testing.assert_allclose(torques(100), no_spring)
 
 
-def test_gravity_compensation_runs_no_callbacks():
-    """A gravity query must not run global MuJoCo callbacks (a control callback could recurse)."""
+MOCAP_MOUNT_XML = """<mujoco><worldbody><body name="mount" mocap="true" pos="0 0 1">
+  <body name="l1"><joint name="j1" type="hinge" axis="0 1 0"/>
+    <geom type="capsule" fromto="0 0 0 .3 0 0" size=".02" mass="1"/>
+    <body name="l2" pos=".3 0 0"><joint name="j2" type="hinge" axis="0 1 0"/>
+      <geom type="capsule" fromto="0 0 0 .3 0 0" size=".02" mass="1"/>
+      <site name="tip" pos=".3 0 0"/></body></body>
+  </body></worldbody></mujoco>"""
+
+
+def test_scratch_queries_follow_moved_mocap_mount():
+    """Scratch-copy queries use the live mocap pose, not the model default."""
+    model = mujoco.MjModel.from_xml_string(MOCAP_MOUNT_XML)
+    r = MujocoRobot(model=model, joint_names=["j1", "j2"], verbose=False)
+    try:
+        r.data.qpos[:] = [0.3, -0.6]
+        r.data.mocap_pos[0] = [0.2, -0.1, 1.3]
+        r.data.mocap_quat[0] = [np.cos(0.4), np.sin(0.4), 0.0, 0.0]  # 0.8 rad about x
+        mujoco.mj_forward(r.model, r.data)
+        np.testing.assert_allclose(r.get_gravity_compensation_torques(), r.data.qfrc_bias)
+        q_other = np.array([0.5, -0.9])
+        jac = r.get_jacobian("tip", joint_angles=q_other)
+        assert np.abs(jac).max() > 0.1
+        r.data.qpos[:] = q_other
+        mujoco.mj_forward(r.model, r.data)
+        np.testing.assert_allclose(jac, r.get_jacobian("tip"), atol=1e-12)
+    finally:
+        r.shutdown()
+
+
+def test_scratch_queries_run_no_callbacks():
+    """Scratch-copy queries run no global MuJoCo callbacks (a control callback could recurse)."""
     calls = []
     r = make()
     try:
         mujoco.set_mjcb_control(lambda m, d: calls.append("control"))
         mujoco.set_mjcb_passive(lambda m, d: calls.append("passive"))
         r.get_gravity_compensation_torques()
+        r.get_jacobian("hand", joint_angles=r.get_actuated_joint_positions() + 0.1)
     finally:
         mujoco.set_mjcb_control(None)
         mujoco.set_mjcb_passive(None)

@@ -1,5 +1,6 @@
 """Tests for the differential_ik helper. Physics only, no rendering."""
 
+import mujoco
 import numpy as np
 from scipy.spatial.transform import Rotation
 import pytest
@@ -11,6 +12,16 @@ from mujoco_robot.utils.robot_loader_utils import get_mjcf_from_awesome_robot_de
 
 PANDA = get_mjcf_from_awesome_robot_descriptions("panda_mj_description")
 NEUTRAL = [0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785, 0.02, 0.02]
+
+
+# A two-link arm on a mocap mount, with a site at the tip.
+MOCAP_MOUNT_XML = """<mujoco><worldbody><body name="mount" mocap="true" pos="0 0 1">
+  <body name="l1"><joint name="j1" type="hinge" axis="0 1 0"/>
+    <geom type="capsule" fromto="0 0 0 .3 0 0" size=".02" mass="1"/>
+    <body name="l2" pos=".3 0 0"><joint name="j2" type="hinge" axis="0 1 0"/>
+      <geom type="capsule" fromto="0 0 0 .3 0 0" size=".02" mass="1"/>
+      <site name="tip" pos=".3 0 0"/></body></body>
+  </body></worldbody></mujoco>"""
 
 
 def _robot() -> MujocoRobot:
@@ -65,6 +76,45 @@ def test_does_not_mutate_live_data():
         assert np.allclose(r.data.qpos, qpos_before)  # solved on a copy
     finally:
         r.shutdown()
+
+
+def test_reaches_target_on_moved_mocap_mount():
+    """The solution, checked with FK in the live mount pose, places the site at the target."""
+    model = mujoco.MjModel.from_xml_string(MOCAP_MOUNT_XML)
+    data = mujoco.MjData(model)
+    data.qpos[:] = [0.3, -0.6]
+    data.mocap_pos[0] = [0.2, -0.1, 1.3]
+    data.mocap_quat[0] = [np.cos(0.4), np.sin(0.4), 0.0, 0.0]  # 0.8 rad about x
+    mujoco.mj_forward(model, data)
+
+    # A reachable target: the site position of another configuration on the same mount.
+    goal = mujoco.MjData(model)
+    goal.qpos[:] = [0.9, -0.3]
+    goal.mocap_pos[:] = data.mocap_pos
+    goal.mocap_quat[:] = data.mocap_quat
+    mujoco.mj_kinematics(model, goal)
+    target = goal.site_xpos[0].copy()
+    assert np.linalg.norm(target - data.site_xpos[0]) > 0.05
+
+    data.qpos[:] = differential_ik(model, data, "tip", target)
+    mujoco.mj_kinematics(model, data)
+    assert np.linalg.norm(data.site_xpos[0] - target) < 1e-3
+
+
+def test_runs_no_callbacks():
+    """The solve must not run global MuJoCo callbacks on its copy."""
+    calls = []
+    r = _robot()
+    try:
+        target = r.get_site_pose(r.get_site_id("ik_target"))[0] + np.array([0.05, 0.0, -0.05])
+        mujoco.set_mjcb_control(lambda m, d: calls.append("control"))
+        mujoco.set_mjcb_passive(lambda m, d: calls.append("passive"))
+        differential_ik(r.model, r.data, "ik_target", target)
+    finally:
+        mujoco.set_mjcb_control(None)
+        mujoco.set_mjcb_passive(None)
+        r.shutdown()
+    assert calls == []
 
 
 def test_missing_site_raises():
