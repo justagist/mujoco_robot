@@ -106,14 +106,15 @@ def test_scratch_queries_follow_moved_mocap_mount():
         r.shutdown()
 
 
-def test_gravity_compensation_runs_no_callbacks():
-    """A gravity query must not run global MuJoCo callbacks (a control callback could recurse)."""
+def test_scratch_queries_run_no_callbacks():
+    """Scratch-copy queries run no global MuJoCo callbacks (a control callback could recurse)."""
     calls = []
     r = make()
     try:
         mujoco.set_mjcb_control(lambda m, d: calls.append("control"))
         mujoco.set_mjcb_passive(lambda m, d: calls.append("passive"))
         r.get_gravity_compensation_torques()
+        r.get_jacobian("hand", joint_angles=r.get_actuated_joint_positions() + 0.1)
     finally:
         mujoco.set_mjcb_control(None)
         mujoco.set_mjcb_passive(None)

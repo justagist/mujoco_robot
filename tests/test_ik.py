@@ -90,6 +90,22 @@ def test_uses_live_mocap_mount_pose():
     np.testing.assert_allclose(q, [0.3, -0.6])
 
 
+def test_runs_no_callbacks():
+    """The solve must not run global MuJoCo callbacks on its copy."""
+    calls = []
+    r = _robot()
+    try:
+        target = r.get_site_pose(r.get_site_id("ik_target"))[0] + np.array([0.05, 0.0, -0.05])
+        mujoco.set_mjcb_control(lambda m, d: calls.append("control"))
+        mujoco.set_mjcb_passive(lambda m, d: calls.append("passive"))
+        differential_ik(r.model, r.data, "ik_target", target)
+    finally:
+        mujoco.set_mjcb_control(None)
+        mujoco.set_mjcb_passive(None)
+        r.shutdown()
+    assert calls == []
+
+
 def test_missing_site_raises():
     r = _robot()
     try:

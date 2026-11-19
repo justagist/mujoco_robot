@@ -64,7 +64,7 @@ def differential_ik(
     Solves on a COPY of ``data`` (the live simulation is never mutated) for joint positions that
     place the named site at ``target_pos`` and, if given, ``target_quat`` (otherwise the target is
     position-only). Iterates ``dq = Jᵀ (J Jᵀ + damping² I)⁻¹ e`` with a per-step norm clamp, then
-    integrates and clamps to joint limits.
+    integrates and clamps to joint limits. No global MuJoCo callback runs.
 
     Args:
         model (mujoco.MjModel): The model.
@@ -108,7 +108,10 @@ def differential_ik(
     scratch.qpos[:] = data.qpos
     scratch.mocap_pos[:] = data.mocap_pos
     scratch.mocap_quat[:] = data.mocap_quat
-    mujoco.mj_forward(model, scratch)
+    # Only the stages that site poses and mj_jacSite read: mj_forward would run the global
+    # callbacks.
+    mujoco.mj_kinematics(model, scratch)
+    mujoco.mj_comPos(model, scratch)
 
     target_pos = np.asarray(target_pos, dtype=float)
     track_rot = target_quat is not None
@@ -153,7 +156,8 @@ def differential_ik(
             dq = dq_full
         mujoco.mj_integratePos(model, scratch.qpos, dq, 1.0)
         _clamp_to_limits(model, scratch.qpos, joint_ids)
-        mujoco.mj_forward(model, scratch)
+        mujoco.mj_kinematics(model, scratch)
+        mujoco.mj_comPos(model, scratch)
 
     if joint_ids is not None:
         return np.array([float(scratch.qpos[int(model.jnt_qposadr[j])]) for j in joint_ids])

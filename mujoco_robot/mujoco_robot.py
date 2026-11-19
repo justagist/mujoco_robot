@@ -1004,7 +1004,7 @@ class MujocoRobot(MujocoObject):
             ee_link_name (str | Frame): Link (body) or site to compute the Jacobian for.
             joint_angles (np.ndarray, optional): Actuated-joint configuration to evaluate at.
                 Defaults to None (use the current configuration). Evaluated on a scratch copy so
-                the live state is not disturbed.
+                the live state is not disturbed and no global MuJoCo callback runs.
 
         Returns:
             np.ndarray: 6xN Jacobian matrix.
@@ -1016,7 +1016,9 @@ class MujocoRobot(MujocoObject):
         with self._lock:
             scratch = self._get_scratch_data()
             scratch.qpos[self.actuated_joint_qpos_adrs] = joint_angles
-            mujoco.mj_forward(self.model, scratch)
+            # Only the stages the Jacobian reads: mj_forward would run the global callbacks.
+            mujoco.mj_kinematics(self.model, scratch)
+            mujoco.mj_comPos(self.model, scratch)
             return self._jacobian_from_data(scratch, frame)
 
     # --- dynamics -----------------------------------------------------------
